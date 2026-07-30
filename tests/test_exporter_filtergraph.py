@@ -2,7 +2,13 @@ from pathlib import Path
 import unittest
 
 from cove_video_editor.clip import Clip, MediaAsset
-from cove_video_editor.exporter import AudioTrack, ExportJob, ExportWorker, _join_filter_labels
+from cove_video_editor.exporter import (
+    AudioTrack,
+    ExportJob,
+    ExportWorker,
+    _join_filter_labels,
+    resolve_target_size,
+)
 
 
 def _asset(
@@ -316,6 +322,130 @@ class ExporterFiltergraphTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "no clips to export"):
             worker._build_command()
+
+
+def _filter_complex(cmd: list[str]) -> str:
+    return cmd[cmd.index("-filter_complex") + 1]
+
+
+class ResolveTargetSizeTests(unittest.TestCase):
+    """Pure target-size policy: crop > explicit width/height > first real
+    visual clip > 1280x720, with the final dimensions forced even."""
+
+    def test_auto_uses_first_real_clip(self) -> None:
+        clips = [Clip(_asset("hd.mp4", has_audio=True, width=1920, height=1080))]
+        self.assertEqual(resolve_target_size(clips, None, None, None), (1920, 1080))
+
+    def test_auto_ignores_later_mixed_resolution_clips(self) -> None:
+        clips = [
+            Clip(_asset("hd.mp4", has_audio=True, width=1920, height=1080),
+                 timeline_start=0.0),
+            Clip(_asset("wxga.mp4", has_audio=True, width=1366, height=768),
+                 timeline_start=1.0),
+        ]
+        self.assertEqual(resolve_target_size(clips, None, None, None), (1920, 1080))
+
+    def test_explicit_landscape_preset_overrides_auto(self) -> None:
+        clips = [Clip(_asset("hd.mp4", has_audio=True, width=1920, height=1080))]
+        self.assertEqual(resolve_target_size(clips, None, 1280, 720), (1280, 720))
+
+    def test_explicit_portrait_preset_overrides_auto(self) -> None:
+        clips = [Clip(_asset("hd.mp4", has_audio=True, width=1920, height=1080))]
+        self.assertEqual(resolve_target_size(clips, None, 1080, 1920), (1080, 1920))
+
+    def test_explicit_square_preset_overrides_auto(self) -> None:
+        clips = [Clip(_asset("hd.mp4", has_audio=True, width=1920, height=1080))]
+        self.assertEqual(resolve_target_size(clips, None, 1080, 1080), (1080, 1080))
+
+    def test_crop_overrides_explicit_preset(self) -> None:
+        clips = [Clip(_asset("hd.mp4", has_audio=True, width=1920, height=1080))]
+        self.assertEqual(
+            resolve_target_size(clips, (10, 20, 640, 480), 1080, 1920), (640, 480)
+        )
+
+    def test_no_real_visual_clip_falls_back_to_720p(self) -> None:
+        self.assertEqual(resolve_target_size([], None, None, None), (1280, 720))
+        zero = [Clip(_asset("audio-ish.mp4", has_audio=True, width=0, height=0))]
+        self.assertEqual(resolve_target_size(zero, None, None, None), (1280, 720))
+
+    def test_odd_source_dimensions_are_forced_even(self) -> None:
+        clips = [Clip(_asset("odd.mp4", has_audio=True, width=1921, height=1081))]
+        self.assertEqual(resolve_target_size(clips, None, None, None), (1920, 1080))
+
+    def test_odd_crop_dimensions_are_forced_even(self) -> None:
+        clips = [Clip(_asset("hd.mp4", has_audio=True, width=1920, height=1080))]
+        self.assertEqual(
+            resolve_target_size(clips, (0, 0, 641, 481), None, None), (640, 480)
+        )
+
+    def test_leading_gap_does_not_define_target(self) -> None:
+        """A clip starting later on the timeline still defines the target;
+        the synthesized leading gap does not."""
+        clips = [Clip(_asset("hd.mp4", has_audio=True, width=1920, height=1080),
+                      timeline_start=5.0)]
+        self.assertEqual(resolve_target_size(clips, None, None, None), (1920, 1080))
+
+    def test_partial_explicit_size_is_ignored(self) -> None:
+        clips = [Clip(_asset("hd.mp4", has_audio=True, width=1920, height=1080))]
+        self.assertEqual(resolve_target_size(clips, None, 1280, None), (1920, 1080))
+        self.assertEqual(resolve_target_size(clips, None, None, 720), (1920, 1080))
+
+
+class ExplicitResolutionCommandTests(unittest.TestCase):
+    def _mixed_clips(self) -> list[Clip]:
+        return [
+            Clip(_asset("hd.mp4", has_audio=True, width=1920, height=1080),
+                 timeline_start=0.0),
+            Clip(_asset("wxga.mp4", has_audio=True, width=1366, height=768),
+                 timeline_start=1.0),
+        ]
+
+    def _graph_for(self, width: int | None, height: int | None) -> str:
+        job = ExportJob(
+            clips=self._mixed_clips(), output=Path("out.mp4"),
+            fmt_key="MP4 (H.264 + AAC)", width=width, height=height,
+        )
+        return _filter_complex(ExportWorker(job)._build_command())
+
+    def _assert_targets(self, graph: str, w: int, h: int) -> None:
+        v_parts = [p for p in graph.split(";")
+                   if p.endswith("[v0]") or p.endswith("[v1]")]
+        self.assertEqual(len(v_parts), 2)
+        for part in v_parts:
+            self.assertIn(
+                f"scale={w}:{h}:force_original_aspect_ratio=decrease"
+                ":force_divisible_by=2", part,
+            )
+            self.assertIn(f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black", part)
+            self.assertIn("setsar=1", part)
+            self.assertIn("format=yuv420p", part)
+
+    def test_explicit_720p_targets_1280x720(self) -> None:
+        self._assert_targets(self._graph_for(1280, 720), 1280, 720)
+
+    def test_explicit_portrait_targets_1080x1920(self) -> None:
+        self._assert_targets(self._graph_for(1080, 1920), 1080, 1920)
+
+    def test_explicit_square_targets_1080x1080(self) -> None:
+        self._assert_targets(self._graph_for(1080, 1080), 1080, 1080)
+
+    def test_auto_still_targets_first_real_clip(self) -> None:
+        self._assert_targets(self._graph_for(None, None), 1920, 1080)
+
+    def test_audio_only_command_ignores_width_and_height(self) -> None:
+        track = AudioTrack(path=Path("added.mp3"), offset=0.0, duration=2.0)
+        job = ExportJob(
+            clips=[], output=Path("out.wav"), fmt_key="WAV (audio only)",
+            audio_tracks=[track], width=1080, height=1920,
+        )
+        cmd = ExportWorker(job)._build_command()
+        graph = _filter_complex(cmd)
+
+        self.assertNotIn("-c:v", cmd)
+        self.assertEqual(cmd.count("-map"), 1)
+        self.assertNotIn("scale=", graph)
+        self.assertNotIn("1080:1920", graph)
+        self.assertEqual(cmd[-1], "out.wav")
 
 
 if __name__ == "__main__":

@@ -195,6 +195,7 @@ def _probe_streams(path: Path) -> tuple[list[dict], float]:
 
 
 MIXED_RES_LABEL = "mixed-resolution timeline"
+EXPLICIT_RES_LABEL = "explicit 1280x720 from mixed sources"
 
 
 def _probe_video_props(path: Path) -> dict:
@@ -213,19 +214,32 @@ def _probe_video_props(path: Path) -> dict:
     return props
 
 
-def _validate_mixed_resolution(path: Path) -> tuple[str | None, dict]:
-    """Assert the mixed-resolution export matches the first-clip target policy."""
+def _validate_target_resolution(
+    path: Path, exp_w: int, exp_h: int, *, require_yuv420p: bool = False
+) -> tuple[str | None, dict]:
+    """Assert the export landed on the expected target size with SAR 1:1."""
     props = _probe_video_props(path)
     if not props.get("codec_name"):
         return "no video stream", props
-    if (props.get("width"), props.get("height")) != (1920, 1080):
-        return f"expected 1920x1080, got {props.get('width')}x{props.get('height')}", props
+    if (props.get("width"), props.get("height")) != (exp_w, exp_h):
+        return (
+            f"expected {exp_w}x{exp_h}, got "
+            f"{props.get('width')}x{props.get('height')}",
+            props,
+        )
     sar = props.get("sample_aspect_ratio") or "1:1"
     if sar not in ("1:1", "N/A"):
         return f"expected SAR 1:1, got {sar}", props
+    if require_yuv420p and props.get("pix_fmt") != "yuv420p":
+        return f"expected pix_fmt yuv420p, got {props.get('pix_fmt')}", props
     if props["duration"] <= 0:
         return f"zero duration ({props['duration']:.3f}s)", props
     return None, props
+
+
+def _validate_mixed_resolution(path: Path) -> tuple[str | None, dict]:
+    """Assert the mixed-resolution export matches the first-clip target policy."""
+    return _validate_target_resolution(path, 1920, 1080)
 
 
 def _validate_output(path: Path, spec: dict) -> str | None:
@@ -395,6 +409,21 @@ def build_matrix(fixtures: dict[str, Path], out_dir: Path) -> list[tuple[str, Ex
                     ),
                 ))
 
+                # Same mixed sources, but with an explicit 1280x720 target
+                # coming from the export bar's Resolution selector.
+                e1 = _make_clip(_asset_from_path(fixtures["video_1080"]), start=0.0, dur=2.0)
+                e2 = _make_clip(_asset_from_path(fixtures["video_768"]), start=2.0, dur=2.0)
+                cases.append((
+                    f"{fmt_key} | {EXPLICIT_RES_LABEL}",
+                    ExportJob(
+                        clips=[e1, e2],
+                        output=out_dir / f"explicit_resolution.{ext}",
+                        fmt_key=fmt_key,
+                        width=1280,
+                        height=720,
+                    ),
+                ))
+
             # Added-audio track
             extra_track = AudioTrack(
                 path=fixtures["extra_audio"],
@@ -472,6 +501,25 @@ def main() -> int:
                 )
                 if err:
                     ok, msg = False, f"mixed-resolution validation failed: {err}"
+
+            if ok and EXPLICIT_RES_LABEL in label:
+                err, props = _validate_target_resolution(
+                    job.output, 1280, 720, require_yuv420p=True
+                )
+                kept_dir = Path(tempfile.mkdtemp(prefix="cove-smoke-explicit-"))
+                kept = kept_dir / "explicit-resolution.mp4"
+                shutil.copy2(job.output, kept)
+                print(f"           explicit-resolution artifact: {kept}")
+                print(
+                    "           ffprobe v:0 "
+                    f"codec_name={props.get('codec_name')} "
+                    f"width={props.get('width')} height={props.get('height')} "
+                    f"sample_aspect_ratio={props.get('sample_aspect_ratio')} "
+                    f"pix_fmt={props.get('pix_fmt')} "
+                    f"duration={props.get('duration'):.3f}"
+                )
+                if err:
+                    ok, msg = False, f"explicit-resolution validation failed: {err}"
 
             if ok:
                 print(f"  {GREEN}PASS{RESET}  [{elapsed:5.1f}s]  {label}")

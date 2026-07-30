@@ -986,6 +986,21 @@ class MainWindow(QMainWindow):
         self.format_combo.setMinimumWidth(220)
         self._populate_format_combo(False)
 
+        # Resolution presets. Dimensions live in the item data (never parsed
+        # back out of the label); "Auto" carries None so the exporter keeps
+        # its first-real-clip behavior.
+        self.resolution_combo = QComboBox()
+        self.resolution_combo.addItem("Auto (First Clip)", None)
+        for _label, _size in (
+            ("3840 × 2160", (3840, 2160)),
+            ("1920 × 1080", (1920, 1080)),
+            ("1280 × 720", (1280, 720)),
+            ("1080 × 1920", (1080, 1920)),
+            ("1080 × 1080", (1080, 1080)),
+        ):
+            self.resolution_combo.addItem(_label, _size)
+        self.resolution_combo.setCurrentIndex(0)
+
         export_lbl = QLabel("EXPORT")
         export_lbl.setObjectName("ExportLabel")
         as_lbl = QLabel("AS")
@@ -994,6 +1009,10 @@ class MainWindow(QMainWindow):
         bottom.addWidget(self.export_type_combo, stretch=0)
         bottom.addWidget(as_lbl)
         bottom.addWidget(self.format_combo, stretch=0)
+        res_lbl = QLabel("Resolution")
+        res_lbl.setObjectName("ExportLabel")
+        bottom.addWidget(res_lbl)
+        bottom.addWidget(self.resolution_combo, stretch=0)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
@@ -2852,11 +2871,18 @@ class MainWindow(QMainWindow):
 
         active_sub = next((s.clone() for s in self._subs if s.active), None)
 
+        # Resolution is a visual-only setting; audio-only jobs always leave
+        # width/height unset.
+        size = None if is_audio_only else self.resolution_combo.currentData()
+        out_w, out_h = size if size else (None, None)
+
         job = ExportJob(
             clips=[c.clone() for c in self._clips],
             output=Path(out_path),
             fmt_key=fmt_key,
             crop=self._crop_pixels(),
+            width=out_w,
+            height=out_h,
             audio_tracks=audio_tracks,
             region_start=region_start,
             region_end=region_end,
@@ -2958,11 +2984,24 @@ class MainWindow(QMainWindow):
         loaded = bool(self._clips)
         has_any = loaded or bool(self._added_audios)
         self.play_btn.setEnabled(has_any)
+        audio_only = self._is_audio_only_export()
+        exporting = self._export_thread is not None
         can_export = export_controls_enabled(
             has_clips=loaded,
             has_added_audio=bool(self._added_audios),
-            audio_only=self._is_audio_only_export(),
-            exporting=self._export_thread is not None,
+            audio_only=audio_only,
+            exporting=exporting,
+        )
+        # Resolution only applies to visual output: it needs visual timeline
+        # content, a Project export, and no export in flight.
+        self.resolution_combo.setEnabled(
+            not audio_only
+            and export_controls_enabled(
+                has_clips=loaded,
+                has_added_audio=bool(self._added_audios),
+                audio_only=False,
+                exporting=exporting,
+            )
         )
         self.crop_btn.setEnabled(loaded)
         self.format_combo.setEnabled(can_export)

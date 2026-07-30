@@ -152,18 +152,7 @@ class ExportWorker(QObject):
         timeline_end = sequence_length(clips) if clips else _audio_only_duration(job.audio_tracks)
         segments = _segments_with_gaps(clips, timeline_end)
 
-        # Output size: honor crop, else take from first real clip, else 1280x720
-        first_real = next((c for c in clips if c.asset.width > 0), None)
-        if job.crop:
-            _, _, tgt_w, tgt_h = job.crop
-        elif job.width and job.height:
-            tgt_w, tgt_h = job.width, job.height
-        elif first_real:
-            tgt_w, tgt_h = first_real.asset.width, first_real.asset.height
-        else:
-            tgt_w, tgt_h = 1280, 720
-        tgt_w -= tgt_w % 2
-        tgt_h -= tgt_h % 2
+        tgt_w, tgt_h = resolve_target_size(clips, job.crop, job.width, job.height)
 
         cmd: list[str] = [ff.require_ffmpeg(), "-nostdin", "-y", "-hide_banner",
                           "-progress", "pipe:1", "-nostats", "-loglevel", "error"]
@@ -509,6 +498,27 @@ class ExportWorker(QObject):
             alpha = 0.35
             self._eta_smoothed = alpha * eta_raw + (1 - alpha) * self._eta_smoothed
         self.eta.emit(self._eta_smoothed)
+
+
+def resolve_target_size(
+    clips: list[Clip],
+    crop: tuple[int, int, int, int] | None,
+    width: int | None,
+    height: int | None,
+) -> tuple[int, int]:
+    """Output size policy: honor crop, else an explicit width+height pair,
+    else the first real (non-gap) visual clip, else 1280x720. Final
+    dimensions are forced even so encoders accept them."""
+    first_real = next((c for c in clips if c.asset.width > 0), None)
+    if crop:
+        _, _, tgt_w, tgt_h = crop
+    elif width and height:
+        tgt_w, tgt_h = width, height
+    elif first_real:
+        tgt_w, tgt_h = first_real.asset.width, first_real.asset.height
+    else:
+        tgt_w, tgt_h = 1280, 720
+    return tgt_w - tgt_w % 2, tgt_h - tgt_h % 2
 
 
 def _audio_only_duration(audio_tracks: list[AudioTrack]) -> float:
