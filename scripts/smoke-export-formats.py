@@ -11,6 +11,7 @@ pass/fail per format. Exits 0 if all pass, 1 if any fail.
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -105,6 +106,36 @@ def make_fixtures(d: Path) -> dict[str, Path]:
     )
     out["still_webp"] = still_webp
 
+    # Mixed-resolution pair: 1920x1080 primary + 1366x768 secondary.
+    # Used to prove concat succeeds when sources differ in size/SAR.
+    video_1080 = d / "video_1080.mp4"
+    _run(
+        [
+            ffmpeg, "-y", "-nostdin",
+            "-f", "lavfi", "-i", "color=c=blue:s=1920x1080:d=2:r=30",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "40",
+            "-c:a", "aac", "-b:a", "64k",
+            str(video_1080),
+        ],
+        "video-1920x1080",
+    )
+    out["video_1080"] = video_1080
+
+    video_768 = d / "video_768.mp4"
+    _run(
+        [
+            ffmpeg, "-y", "-nostdin",
+            "-f", "lavfi", "-i", "color=c=orange:s=1366x768:d=2:r=30",
+            "-f", "lavfi", "-i", "sine=frequency=660:duration=2",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "40",
+            "-c:a", "aac", "-b:a", "64k",
+            str(video_768),
+        ],
+        "video-1366x768",
+    )
+    out["video_768"] = video_768
+
     # Extra audio track (WAV, 3s stereo)
     extra_audio = d / "extra.wav"
     _run(
@@ -161,6 +192,40 @@ def _probe_streams(path: Path) -> tuple[list[dict], float]:
     data = json.loads(out)
     duration = float(data.get("format", {}).get("duration") or 0)
     return data.get("streams", []), duration
+
+
+MIXED_RES_LABEL = "mixed-resolution timeline"
+
+
+def _probe_video_props(path: Path) -> dict:
+    """Return codec_name/width/height/sample_aspect_ratio/pix_fmt of stream v:0."""
+    out = subprocess.check_output(
+        [ff.require_ffprobe(), "-v", "error", "-select_streams", "v:0",
+         "-show_entries",
+         "stream=codec_name,width,height,sample_aspect_ratio,pix_fmt:format=duration",
+         "-of", "json", str(path)],
+        text=True,
+    )
+    data = json.loads(out)
+    streams = data.get("streams", [])
+    props = dict(streams[0]) if streams else {}
+    props["duration"] = float(data.get("format", {}).get("duration") or 0)
+    return props
+
+
+def _validate_mixed_resolution(path: Path) -> tuple[str | None, dict]:
+    """Assert the mixed-resolution export matches the first-clip target policy."""
+    props = _probe_video_props(path)
+    if not props.get("codec_name"):
+        return "no video stream", props
+    if (props.get("width"), props.get("height")) != (1920, 1080):
+        return f"expected 1920x1080, got {props.get('width')}x{props.get('height')}", props
+    sar = props.get("sample_aspect_ratio") or "1:1"
+    if sar not in ("1:1", "N/A"):
+        return f"expected SAR 1:1, got {sar}", props
+    if props["duration"] <= 0:
+        return f"zero duration ({props['duration']:.3f}s)", props
+    return None, props
 
 
 def _validate_output(path: Path, spec: dict) -> str | None:
@@ -316,6 +381,20 @@ def build_matrix(fixtures: dict[str, Path], out_dir: Path) -> list[tuple[str, Ex
                 ),
             ))
 
+            # Mixed-resolution timeline: 1920x1080 followed by 1366x768.
+            # Only exercised for MP4/H.264 to keep harness time down.
+            if fmt_key == "MP4 (H.264 + AAC)":
+                m1 = _make_clip(_asset_from_path(fixtures["video_1080"]), start=0.0, dur=2.0)
+                m2 = _make_clip(_asset_from_path(fixtures["video_768"]), start=2.0, dur=2.0)
+                cases.append((
+                    f"{fmt_key} | {MIXED_RES_LABEL}",
+                    ExportJob(
+                        clips=[m1, m2],
+                        output=out_dir / f"mixed_resolution.{ext}",
+                        fmt_key=fmt_key,
+                    ),
+                ))
+
             # Added-audio track
             extra_track = AudioTrack(
                 path=fixtures["extra_audio"],
@@ -374,6 +453,25 @@ def main() -> int:
             t0 = time.monotonic()
             ok, msg = run_export(job, timeout=90.0)
             elapsed = time.monotonic() - t0
+
+            if ok and MIXED_RES_LABEL in label:
+                err, props = _validate_mixed_resolution(job.output)
+                # Unique destination so repeated runs never clobber an
+                # earlier artifact (or an unrelated file) in the temp dir.
+                kept_dir = Path(tempfile.mkdtemp(prefix="cove-smoke-mixed-"))
+                kept = kept_dir / "mixed-resolution.mp4"
+                shutil.copy2(job.output, kept)
+                print(f"           mixed-resolution artifact: {kept}")
+                print(
+                    "           ffprobe v:0 "
+                    f"codec_name={props.get('codec_name')} "
+                    f"width={props.get('width')} height={props.get('height')} "
+                    f"sample_aspect_ratio={props.get('sample_aspect_ratio')} "
+                    f"pix_fmt={props.get('pix_fmt')} "
+                    f"duration={props.get('duration'):.3f}"
+                )
+                if err:
+                    ok, msg = False, f"mixed-resolution validation failed: {err}"
 
             if ok:
                 print(f"  {GREEN}PASS{RESET}  [{elapsed:5.1f}s]  {label}")

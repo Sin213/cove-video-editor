@@ -5,12 +5,19 @@ from cove_video_editor.clip import Clip, MediaAsset
 from cove_video_editor.exporter import AudioTrack, ExportJob, ExportWorker, _join_filter_labels
 
 
-def _asset(name: str, *, has_audio: bool, kind: str = "video") -> MediaAsset:
+def _asset(
+    name: str,
+    *,
+    has_audio: bool,
+    kind: str = "video",
+    width: int = 1280,
+    height: int = 720,
+) -> MediaAsset:
     return MediaAsset(
         path=Path(name),
         duration=1.0,
-        width=1280,
-        height=720,
+        width=width,
+        height=height,
         fps=30.0,
         has_audio=has_audio,
         kind=kind,
@@ -47,6 +54,106 @@ class ExporterFiltergraphTests(unittest.TestCase):
         self.assertNotIn("[0:v][1:v][2]", concat_line)
         self.assertEqual(v_label, "vc")
         self.assertEqual(a_label, "ac")
+
+    def test_mixed_resolution_video_branches_are_normalized(self) -> None:
+        """Mixed-resolution sources must reach concat with matching SAR and
+        pixel format, not just matching dimensions."""
+        clips = [
+            Clip(_asset("hd.mp4", has_audio=True, width=1920, height=1080),
+                 timeline_start=0.0),
+            Clip(_asset("wxga.mp4", has_audio=True, width=1366, height=768),
+                 timeline_start=1.0),
+        ]
+        job = ExportJob(clips=clips, output=Path("out.mp4"), fmt_key="MP4 (H.264 + AAC)")
+        worker = ExportWorker(job)
+
+        graph, _, _ = worker._build_filtergraph(
+            [("clip", c.timeline_start, c.timeline_end, c) for c in clips],
+            {c.id: i for i, c in enumerate(clips)},
+            [],
+            tgt_w=1920, tgt_h=1080,
+            is_audio_only=False, needs_audio=True,
+        )
+
+        v_parts = [p for p in graph.split(";") if p.endswith("[v0]") or p.endswith("[v1]")]
+        self.assertEqual(len(v_parts), 2)
+        for part in v_parts:
+            self.assertIn("scale=1920:1080:force_original_aspect_ratio=decrease"
+                          ":force_divisible_by=2", part)
+            self.assertIn("pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black", part)
+            self.assertIn("setsar=1", part)
+            self.assertIn("format=yuv420p", part)
+        self.assertIn("[v0][a0][v1][a1]concat=n=2:v=1:a=1[vc][ac]", graph)
+
+    def test_image_and_video_branches_both_normalized(self) -> None:
+        clips = [
+            Clip(_asset("hd.mp4", has_audio=True, width=1920, height=1080),
+                 timeline_start=0.0),
+            Clip(_asset("card.png", has_audio=False, kind="image",
+                        width=800, height=600), timeline_start=1.0),
+        ]
+        job = ExportJob(clips=clips, output=Path("out.mp4"), fmt_key="MP4 (H.264 + AAC)")
+        worker = ExportWorker(job)
+
+        graph, _, _ = worker._build_filtergraph(
+            [("clip", c.timeline_start, c.timeline_end, c) for c in clips],
+            {c.id: i for i, c in enumerate(clips)},
+            [],
+            tgt_w=1920, tgt_h=1080,
+            is_audio_only=False, needs_audio=True,
+        )
+
+        img = next(p for p in graph.split(";") if p.endswith("[v1]"))
+        self.assertIn("setpts=PTS-STARTPTS", img)
+        self.assertNotIn("trim=start=", img)
+        self.assertIn("scale=1920:1080:force_original_aspect_ratio=decrease"
+                      ":force_divisible_by=2", img)
+        self.assertIn("pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black", img)
+        self.assertIn("setsar=1", img)
+        self.assertIn("format=yuv420p", img)
+
+    def test_gap_visual_branch_is_normalized(self) -> None:
+        clip = Clip(_asset("v.mp4", has_audio=True, width=1920, height=1080),
+                    timeline_start=1.0)
+        job = ExportJob(clips=[clip], output=Path("out.mp4"), fmt_key="MP4 (H.264 + AAC)")
+        worker = ExportWorker(job)
+
+        graph, _, _ = worker._build_filtergraph(
+            [("gap", 0.0, 1.0, None), ("clip", 1.0, 2.0, clip)],
+            {clip.id: 0},
+            [],
+            tgt_w=1920, tgt_h=1080,
+            is_audio_only=False, needs_audio=True,
+        )
+
+        gap = next(p for p in graph.split(";") if p.endswith("[v0]"))
+        self.assertIn("color=c=black:s=1920x1080", gap)
+        self.assertIn("setsar=1", gap)
+        self.assertIn("format=yuv420p", gap)
+
+    def test_same_resolution_export_keeps_normalization_and_shape(self) -> None:
+        clips = [
+            Clip(_asset("a.mp4", has_audio=True), timeline_start=0.0),
+            Clip(_asset("b.mp4", has_audio=True), timeline_start=1.0),
+        ]
+        job = ExportJob(clips=clips, output=Path("out.mp4"), fmt_key="MP4 (H.264 + AAC)")
+        worker = ExportWorker(job)
+
+        graph, v_label, a_label = worker._build_filtergraph(
+            [("clip", c.timeline_start, c.timeline_end, c) for c in clips],
+            {c.id: i for i, c in enumerate(clips)},
+            [],
+            tgt_w=1280, tgt_h=720,
+            is_audio_only=False, needs_audio=True,
+        )
+
+        self.assertEqual((v_label, a_label), ("vc", "ac"))
+        self.assertIn("[v0][a0][v1][a1]concat=n=2:v=1:a=1[vc][ac]", graph)
+        for part in [p for p in graph.split(";") if p.endswith("[v0]") or p.endswith("[v1]")]:
+            self.assertIn("scale=1280:720:force_original_aspect_ratio=decrease"
+                          ":force_divisible_by=2", part)
+            self.assertIn("setsar=1", part)
+            self.assertIn("format=yuv420p", part)
 
     def test_concat_label_join_rejects_raw_input_labels(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "invalid concat label"):

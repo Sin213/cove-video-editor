@@ -266,8 +266,10 @@ class ExportWorker(QObject):
                             x, y, w, h = job.crop
                             vchain.append(f"crop={w}:{h}:{x}:{y}")
                         vchain.append(
-                            f"scale={tgt_w}:{tgt_h}:force_original_aspect_ratio=decrease,"
-                            f"pad={tgt_w}:{tgt_h}:(ow-iw)/2:(oh-ih)/2:color=black"
+                            f"scale={tgt_w}:{tgt_h}:force_original_aspect_ratio=decrease"
+                            ":force_divisible_by=2,"
+                            f"pad={tgt_w}:{tgt_h}:(ow-iw)/2:(oh-ih)/2:color=black,"
+                            "setsar=1"
                         )
                         # yuv420p normalizes the pixel format so concat with
                         # neighbouring video clips doesn't fail when the
@@ -280,11 +282,17 @@ class ExportWorker(QObject):
                             x, y, w, h = job.crop
                             vchain.append(f"crop={w}:{h}:{x}:{y}")
                         vchain.append(
-                            f"scale={tgt_w}:{tgt_h}:force_original_aspect_ratio=decrease,"
-                            f"pad={tgt_w}:{tgt_h}:(ow-iw)/2:(oh-ih)/2:color=black"
+                            f"scale={tgt_w}:{tgt_h}:force_original_aspect_ratio=decrease"
+                            ":force_divisible_by=2,"
+                            f"pad={tgt_w}:{tgt_h}:(ow-iw)/2:(oh-ih)/2:color=black,"
+                            "setsar=1"
                         )
                         if abs(c.speed - 1.0) > 1e-6:
                             vchain.append(f"setpts={1.0/c.speed:.5f}*PTS")
+                        # Mixed-resolution sources can reach concat with matching
+                        # dimensions but different SAR/pix_fmt; setsar=1 above and
+                        # yuv420p here keep every visual branch identical.
+                        vchain.append("format=yuv420p")
                     parts.append(f"[{inp}:v]" + ",".join(vchain) + f"[v{i}]")
                     v_labels.append(f"v{i}")
                 if needs_audio:
@@ -312,7 +320,7 @@ class ExportWorker(QObject):
                 if not is_audio_only:
                     parts.append(
                         f"color=c=black:s={tgt_w}x{tgt_h}:d={seg_dur:.3f}:r=30,"
-                        f"format=yuv420p[v{i}]"
+                        f"setsar=1,format=yuv420p[v{i}]"
                     )
                     v_labels.append(f"v{i}")
                 if needs_audio:
