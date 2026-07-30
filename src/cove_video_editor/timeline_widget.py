@@ -93,6 +93,7 @@ class TimelineWidget(QWidget):
     addedAudioOffsetChanged = Signal(str, float)          # audio id, offset
     addedAudioDeleteRequested = Signal(str)               # audio id ("" → clear all)
     addedAudioRangeChanged = Signal(str)                  # audio id — src_start/src_end edited
+    addedAudioVolumeRequested = Signal(str)               # audio id — edit per-item volume
     clipDoubleClicked = Signal(str)               # clip id
     audioLinkToggled = Signal(str)                # clip id
     clipDeleteRequested = Signal(str)             # clip id
@@ -1382,6 +1383,12 @@ class TimelineWidget(QWidget):
             self._hit_added_audio(local_pos, lane=clicked_lane)
             if clicked_lane is not None else None
         )
+        clicked_clip = None
+        if self._video_rect().contains(local_pos):
+            for c in self._clips:
+                if self._clip_rect(c, self._video_rect()).contains(local_pos):
+                    clicked_clip = c
+                    break
         menu = QMenu(self)
         if has_selection:
             menu.addAction("Delete Selected Region")
@@ -1396,11 +1403,17 @@ class TimelineWidget(QWidget):
         remove_all_action = None
         add_lane_action = None
         remove_lane_action = None
+        clip_volume_action = None
+        audio_volume_action = None
+        if clicked_clip is not None:
+            menu.addSeparator()
+            clip_volume_action = menu.addAction("Volume...")
         if clicked_audio is not None:
             menu.addSeparator()
             replace_action = menu.addAction("Replace original audio")
             replace_action.setCheckable(True)
             replace_action.setChecked(self._added_audio_replace)
+            audio_volume_action = menu.addAction("Volume...")
             remove_this_action = menu.addAction("Remove This Audio Clip")
             if len(self._added_audios) > 1:
                 remove_all_action = menu.addAction("Remove All Added Audio")
@@ -1423,6 +1436,12 @@ class TimelineWidget(QWidget):
         text = chosen.text()
         if text == "Split at Playhead":
             self.splitAtPlayheadRequested.emit()
+            return
+        if clip_volume_action is not None and chosen is clip_volume_action:
+            self.clipDoubleClicked.emit(clicked_clip.id)
+            return
+        if audio_volume_action is not None and chosen is audio_volume_action:
+            self.addedAudioVolumeRequested.emit(clicked_audio.id)
             return
         if add_lane_action is not None and chosen is add_lane_action:
             self.add_audio_lane()

@@ -324,6 +324,78 @@ class ExporterFiltergraphTests(unittest.TestCase):
             worker._build_command()
 
 
+class AddedAudioTrackVolumeTests(unittest.TestCase):
+    """Per-item added-audio volume must survive into the filtergraph."""
+
+    def _graph(self, tracks: list[AudioTrack], *, with_clip: bool = True) -> str:
+        clips = [Clip(_asset("v.mp4", has_audio=True), timeline_start=0.0)] if with_clip else []
+        job = ExportJob(
+            clips=clips,
+            output=Path("out.mp4" if with_clip else "out.wav"),
+            fmt_key="MP4 (H.264 + AAC)" if with_clip else "WAV (audio only)",
+            audio_tracks=tracks,
+        )
+        return _filter_complex(ExportWorker(job)._build_command())
+
+    def test_half_volume_added_track_emits_its_volume_filter(self) -> None:
+        graph = self._graph([
+            AudioTrack(path=Path("added.mp3"), offset=0.0, duration=2.0, volume=0.5),
+        ])
+
+        self.assertIn("volume=0.500[extra_a0]", graph)
+
+    def test_default_volume_added_track_keeps_unity_volume_filter(self) -> None:
+        graph = self._graph([
+            AudioTrack(path=Path("added.mp3"), offset=0.0, duration=2.0),
+        ])
+
+        self.assertIn("volume=1.000[extra_a0]", graph)
+
+    def test_single_added_track_keeps_single_track_path_with_volume(self) -> None:
+        graph = self._graph([
+            AudioTrack(path=Path("added.mp3"), offset=0.0, duration=2.0, volume=0.25),
+        ])
+
+        self.assertIn("volume=0.250[extra_a0]", graph)
+        self.assertNotIn("extra_mix", graph)
+
+    def test_two_overlapping_tracks_keep_distinct_volume_filters(self) -> None:
+        graph = self._graph([
+            AudioTrack(path=Path("a.mp3"), offset=0.0, duration=2.0, volume=1.0),
+            AudioTrack(path=Path("b.mp3"), offset=0.5, duration=2.0, volume=0.25),
+        ])
+
+        self.assertIn("volume=1.000[extra_a0]", graph)
+        self.assertIn("volume=0.250[extra_a1]", graph)
+        self.assertIn("[extra_a0][extra_a1]amix=inputs=2", graph)
+        mix_at = graph.index("[extra_a0][extra_a1]amix=inputs=2")
+        self.assertLess(graph.index("volume=0.250[extra_a1]"), mix_at)
+
+    def test_two_overlapping_tracks_keep_boosted_and_reduced_values(self) -> None:
+        graph = self._graph([
+            AudioTrack(path=Path("a.mp3"), offset=0.0, duration=2.0, volume=1.5),
+            AudioTrack(path=Path("b.mp3"), offset=0.5, duration=2.0, volume=0.5),
+        ])
+
+        self.assertIn("volume=1.500[extra_a0]", graph)
+        self.assertIn("volume=0.500[extra_a1]", graph)
+
+    def test_audio_only_command_retains_added_track_volume(self) -> None:
+        graph = self._graph(
+            [AudioTrack(path=Path("added.mp3"), offset=0.0, duration=2.0, volume=0.5)],
+            with_clip=False,
+        )
+
+        self.assertIn("volume=0.500[extra_a0]", graph)
+
+    def test_project_export_command_retains_added_track_volume(self) -> None:
+        graph = self._graph([
+            AudioTrack(path=Path("added.mp3"), offset=0.0, duration=2.0, volume=0.5),
+        ])
+
+        self.assertIn("volume=0.500[extra_a0]", graph)
+
+
 def _filter_complex(cmd: list[str]) -> str:
     return cmd[cmd.index("-filter_complex") + 1]
 

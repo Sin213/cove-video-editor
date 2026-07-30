@@ -55,6 +55,7 @@ from PySide6.QtWidgets import (
     QGraphicsSimpleTextItem,
     QGraphicsView,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -665,6 +666,10 @@ class MainWindow(QMainWindow):
         else:
             self._preview_clip_id = ""
             self.player.setSource(QUrl())
+        # `_set_preview_clip()` refreshes the output gains, but the clipless
+        # branch above doesn't — an audio-only timeline would keep the
+        # pre-undo per-item added-audio gain on its live QAudioOutputs.
+        self._update_audio_volumes()
 
         self._sync_selected_clip_ui()
         self._update_range_label()
@@ -925,6 +930,7 @@ class MainWindow(QMainWindow):
         self.timeline.addedAudioReplaceToggled.connect(self._on_added_audio_replace_toggled)
         self.timeline.addedAudioOffsetChanged.connect(self._on_added_audio_offset_changed)
         self.timeline.addedAudioRangeChanged.connect(self._on_added_audio_range_changed)
+        self.timeline.addedAudioVolumeRequested.connect(self._on_added_audio_volume_requested)
         self.timeline.clipDoubleClicked.connect(self._open_clip_properties)
         self.timeline.audioLinkToggled.connect(self._on_audio_link_toggled)
         self.timeline.clipDeleteRequested.connect(self._on_clip_delete_requested)
@@ -2304,8 +2310,13 @@ class MainWindow(QMainWindow):
         else:
             self.audio.setVolume(orig_vol)
             self.clip_audio_output.setVolume(0.0)
-        for out in self._added_outputs.values():
-            out.setVolume(added_gain)
+        # Each added-audio item scales the global gain by its own volume.
+        # QAudioOutput accepts 0.0-1.0, so anything above 100% is clamped in
+        # preview only — export keeps the exact value.
+        item_volumes = {a.id: a.volume for a in self._added_audios}
+        for aid, out in self._added_outputs.items():
+            item_vol = item_volumes.get(aid, 1.0)
+            out.setVolume(max(0.0, min(1.0, added_gain * item_vol)))
 
     _SYNC_DRIFT_MS = 200
 
@@ -2580,6 +2591,24 @@ class MainWindow(QMainWindow):
         audio.offset = max(0.0, float(offset))
         self._sync_added_audio_playback()
         self._update_controls_enabled()
+
+    def _on_added_audio_volume_requested(self, audio_id: str) -> None:
+        """Edit one added-audio item's own gain. Cancelling, or accepting the
+        value it already has, leaves the undo history untouched."""
+        audio = next((a for a in self._added_audios if a.id == audio_id), None)
+        if audio is None:
+            return
+        current = int(round(audio.volume * 100))
+        pct, ok = QInputDialog.getInt(
+            self, "Audio Volume", "Volume (%):", current, 0, 200, 5,
+        )
+        if not ok or pct == current:
+            return
+        self._snapshot()
+        audio.volume = pct / 100.0
+        self._refresh_added_audio_display()
+        self._update_audio_volumes()
+        self.status.showMessage(f"Added audio volume set to {pct}%.", 3000)
 
     def _on_added_audio_range_changed(self, audio_id: str) -> None:
         self._snapshot()
@@ -2857,7 +2886,7 @@ class MainWindow(QMainWindow):
                 AudioTrack(
                     path=audio.path,
                     replace=replace,
-                    volume=vol,
+                    volume=audio.volume * vol,
                     original_volume=orig_vol,
                     offset=audio.offset,
                     duration=audio.src_span,
