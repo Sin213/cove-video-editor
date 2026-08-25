@@ -140,6 +140,74 @@ def export_controls_enabled(
     return has_clips
 
 
+# Two computed timeline positions this close together are the same cut point.
+# Matches the tolerance the rest of the timeline code uses for clip edges.
+_CUT_EPS = 1e-4
+
+
+def plan_ripple_move(
+    clips: list[Clip],
+    clip_id: str,
+    target_start: float,
+) -> dict[str, float] | None:
+    """Work out where every visual clip lands when `clip_id` is sent to
+    `target_start`, or return None when nothing would change.
+
+    Pure position math, deliberately split out of the widget/undo wiring so
+    the ordering rules can be tested without a window.
+
+    The single video track cannot hold overlapping clips, so `target_start`
+    is resolved to the nearest *cut point*: t=0, or an edge of one of the
+    other clips once this clip has been pulled out of the sequence. The
+    layout is then rebuilt in one pass:
+
+    1. Pull the moving clip out; clips that sat after it slide left by its
+       length, closing the gap it vacated.
+    2. Collect the cut points of that adjusted sequence.
+    3. Snap the request to the nearest cut point. On an exact tie the
+       earlier (smaller) position wins, so the result never depends on
+       iteration order.
+    4. Open a gap of the clip's length at that cut point by pushing the
+       clips at or after it back to the right, and drop the clip in.
+
+    Clips that do not move keep their spacing relative to each other, so
+    deliberate gaps elsewhere in the sequence survive the operation.
+    """
+    clip = next((c for c in clips if c.id == clip_id), None)
+    if clip is None:
+        return None
+    target_start = max(0.0, target_start)
+    length = clip.timeline_length
+    old = clip.timeline_start
+
+    # Step 1 + 2: the sequence with this clip pulled out, and its cut points.
+    adjusted: list[tuple[Clip, float]] = []
+    cut_points: list[float] = [0.0]
+    for c in clips:
+        if c.id == clip_id:
+            continue
+        ns = c.timeline_start - (length if c.timeline_start > old else 0.0)
+        ns = max(0.0, ns)
+        adjusted.append((c, ns))
+        cut_points.append(ns)
+        cut_points.append(ns + c.timeline_length)
+
+    # Step 3: nearest cut point, earlier one on a tie.
+    target = min(cut_points, key=lambda b: (abs(b - target_start), b))
+    if abs(target - old) < _CUT_EPS:
+        # Same cut point it already occupies, so the effective layout is
+        # unchanged: no mutation and no undo entry.
+        return None
+
+    # Step 4: reopen a gap of `length` at the target and place the clip.
+    plan = {clip_id: target}
+    for c, ns in adjusted:
+        if ns >= target - _CUT_EPS:
+            ns += length
+        plan[c.id] = max(0.0, ns)
+    return plan
+
+
 # ── Inline icon painters for transport / zoom buttons ──────────────────────
 # Avoiding an external icon file keeps the install footprint small and lets
 # icons inherit the current palette color on hover. The shapes match the
@@ -934,6 +1002,8 @@ class MainWindow(QMainWindow):
         self.timeline.clipDoubleClicked.connect(self._open_clip_properties)
         self.timeline.audioLinkToggled.connect(self._on_audio_link_toggled)
         self.timeline.clipDeleteRequested.connect(self._on_clip_delete_requested)
+        self.timeline.clipMoveToStartRequested.connect(self._on_clip_move_to_start)
+        self.timeline.clipMoveToPlayheadRequested.connect(self._on_clip_move_to_playhead)
         self.timeline.audioOffsetChanged.connect(self._on_audio_offset_changed)
         self.timeline.clipAudioRemoveRequested.connect(self._on_clip_audio_remove_requested)
         self.timeline.scrollRangeChanged.connect(self._on_timeline_scroll_range)
@@ -2007,6 +2077,45 @@ class MainWindow(QMainWindow):
             self.timeline._added_audio_selected_id = ""
             self._remove_added_audio(sel_audio_id)
             return
+
+    def _on_clip_move_to_start(self, clip_id: str) -> None:
+        self._ripple_move_clip(clip_id, 0.0)
+
+    def _on_clip_move_to_playhead(self, clip_id: str) -> None:
+        # The playhead is a target reference here, not something that moves.
+        self._ripple_move_clip(clip_id, self.timeline.playhead())
+
+    def _ripple_move_clip(self, clip_id: str, target_start: float) -> None:
+        """Send a visual clip to `target_start` as one undoable action.
+
+        This is the zero-drag way to close the leading gap left behind by
+        trimming the head off the first clip, which otherwise strands the
+        beginning of a long sequence off to the left. `plan_ripple_move`
+        owns the position math; this only applies it and republishes.
+
+        AddedAudio is untouched: it is an independent absolute-time layer
+        with no stored link to any clip, so moving video must not guess at
+        a sync relationship the project does not record.
+        """
+        plan = plan_ripple_move(self._clips, clip_id, target_start)
+        if plan is None:
+            return
+        self._snapshot()
+        for c in self._clips:
+            new_start = plan[c.id]
+            if not c.linked_audio:
+                # Detached clip audio is pinned to absolute timeline time,
+                # exactly as dragging a clip already treats it. Compensate
+                # the offset so a ripple never slides it out of sync.
+                c.audio_offset += c.timeline_start - new_start
+            c.timeline_start = new_start
+        self._clips = sort_clips(self._clips)
+        self.timeline.set_clips(self._clips)
+        self.timeline.select_clip(clip_id)
+        self._sync_selected_clip_ui()
+        self._update_range_label()
+        self._drive_main_player_from_playhead()
+        self.status.showMessage("Clip moved.", 2000)
 
     def _on_clip_delete_requested(self, clip_id: str) -> None:
         self._delete_clip_by_id(clip_id)

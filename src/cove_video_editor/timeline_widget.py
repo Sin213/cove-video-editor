@@ -97,6 +97,8 @@ class TimelineWidget(QWidget):
     clipDoubleClicked = Signal(str)               # clip id
     audioLinkToggled = Signal(str)                # clip id
     clipDeleteRequested = Signal(str)             # clip id
+    clipMoveToStartRequested = Signal(str)        # clip id - ripple to t=0
+    clipMoveToPlayheadRequested = Signal(str)     # clip id - ripple to playhead
     audioOffsetChanged = Signal(str, float)       # clip id, new audio_offset (seconds)
     clipAudioRemoveRequested = Signal(str)        # clip id — delete clip's audio only
     scrollRangeChanged = Signal(int, int)         # scroll_max, page (in px)
@@ -182,8 +184,7 @@ class TimelineWidget(QWidget):
 
     def clear_selection(self) -> None:
         if self._sel_end > self._sel_start:
-            self._sel_start = 0.0
-            self._sel_end = 0.0
+            self._set_selection_span(0.0, 0.0)
             self.selectionChanged.emit(0.0, 0.0)
             self.update()
 
@@ -235,6 +236,9 @@ class TimelineWidget(QWidget):
             a.id == self._added_audio_selected_id for a in self._added_audios
         ):
             self._added_audio_selected_id = ""
+        # Added audio counts towards `_total_length()`, so removing or
+        # shortening the longest item shrinks the scrollable range.
+        self._publish_scroll_range()
         self.update()
 
     def _maintain_trailing_empty_lane(self) -> None:
@@ -269,14 +273,31 @@ class TimelineWidget(QWidget):
         self._added_audio_replace = bool(replace)
 
     def set_selection_range(self, start: float, end: float) -> None:
-        self._sel_start = max(0.0, min(start, end))
-        self._sel_end = max(self._sel_start, end)
+        self._set_selection_span(start, end)
         self.selectionChanged.emit(self._sel_start, self._sel_end)
         self.update()
 
+    def _set_selection_span(self, start: float, end: float) -> None:
+        """Write the selection span and republish the scroll range.
+
+        Selection endpoints feed `_total_length()`, so a region dragged past
+        the content extends the scrollable range and collapsing it shrinks
+        the range again. Routing every write through here keeps
+        `_scroll_x` inside `[0, scroll_max_px()]` without a clamp in each
+        mouse handler."""
+        self._sel_start = max(0.0, min(start, end))
+        self._sel_end = max(self._sel_start, end)
+        self._publish_scroll_range()
+
     def set_scroll_x(self, x: int) -> None:
-        self._scroll_x = max(0, int(x))
+        self._scroll_x = self._clamped_scroll_x(x)
         self.update()
+
+    def _clamped_scroll_x(self, x: int) -> int:
+        """Fold a candidate offset into the only legal range,
+        ``0 <= scroll <= scroll_max_px()``. Single source of truth for the
+        upper bound so no caller has to recompute the track width."""
+        return max(0, min(int(x), self.scroll_max_px()))
 
     def scroll_max_px(self) -> int:
         total = max(self._total_length() + 2.0, 0.1)
@@ -350,6 +371,12 @@ class TimelineWidget(QWidget):
         self._publish_scroll_range()
 
     def _publish_scroll_range(self) -> None:
+        # Content shrinks behind the viewport on trim / delete / undo / ripple
+        # move, which can leave `_scroll_x` past the new end. Re-clamp here,
+        # since every model republish and geometry change funnels through this
+        # method, so the beginning of the timeline is reachable again without
+        # the user first having to wheel or drag the view back into range.
+        self._scroll_x = self._clamped_scroll_x(self._scroll_x)
         self.scrollRangeChanged.emit(self.scroll_max_px(), self._track_rect().width())
         self.scrollValueChanged.emit(self._scroll_x)
 
@@ -963,8 +990,7 @@ class TimelineWidget(QWidget):
         if shift_held and hit.mode != "seek":
             t = self._x_to_time(pos.x())
             self._drag = _Drag(mode="select", anchor_t=t, press_x=pos.x())
-            self._sel_start = t
-            self._sel_end = t
+            self._set_selection_span(t, t)
             self.update()
             return
 
@@ -976,8 +1002,7 @@ class TimelineWidget(QWidget):
         if hit.mode == "playhead_region":
             t = self._playhead
             self._drag = _Drag(mode="select", anchor_t=t, press_x=pos.x())
-            self._sel_start = t
-            self._sel_end = t
+            self._set_selection_span(t, t)
             self.update()
             return
         if hit.mode == "chain":
@@ -1052,8 +1077,7 @@ class TimelineWidget(QWidget):
         # empty area drag → region select
         t = self._x_to_time(pos.x())
         self._drag = _Drag(mode="select", anchor_t=t, press_x=pos.x())
-        self._sel_start = t
-        self._sel_end = t
+        self._set_selection_span(t, t)
         self.update()
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
@@ -1097,8 +1121,7 @@ class TimelineWidget(QWidget):
             self.set_playhead(t)
         elif self._drag.mode == "select":
             a = self._drag.anchor_t
-            self._sel_start = min(a, t)
-            self._sel_end = max(a, t)
+            self._set_selection_span(min(a, t), max(a, t))
             self.update()
         elif self._drag.mode in ("trim_l", "trim_r"):
             self._apply_trim(self._drag.mode, t)
@@ -1405,8 +1428,14 @@ class TimelineWidget(QWidget):
         remove_lane_action = None
         clip_volume_action = None
         audio_volume_action = None
+        move_start_action = None
+        move_playhead_action = None
         if clicked_clip is not None:
             menu.addSeparator()
+            # Zero-drag repositioning: the way back from a leading gap left
+            # by head-trimming, without dragging across a long sequence.
+            move_start_action = menu.addAction("Move to Start")
+            move_playhead_action = menu.addAction("Move to Playhead")
             clip_volume_action = menu.addAction("Volume...")
         if clicked_audio is not None:
             menu.addSeparator()
@@ -1436,6 +1465,12 @@ class TimelineWidget(QWidget):
         text = chosen.text()
         if text == "Split at Playhead":
             self.splitAtPlayheadRequested.emit()
+            return
+        if move_start_action is not None and chosen is move_start_action:
+            self.clipMoveToStartRequested.emit(clicked_clip.id)
+            return
+        if move_playhead_action is not None and chosen is move_playhead_action:
+            self.clipMoveToPlayheadRequested.emit(clicked_clip.id)
             return
         if clip_volume_action is not None and chosen is clip_volume_action:
             self.clipDoubleClicked.emit(clicked_clip.id)
