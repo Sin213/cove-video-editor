@@ -19,7 +19,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QSize, Qt, Signal
+from PySide6.QtCore import (
+    QEvent, QPoint, QPointF, QRect, QSize, Qt, QTimer, Signal,
+)
 from PySide6.QtGui import (
     QColor,
     QDragEnterEvent,
@@ -60,6 +62,43 @@ CLICK_SLOP_PX = 5
 CHAIN_BTN_W = 22
 CHAIN_BTN_H = 18
 CHAIN_BTN_MARGIN = 4
+
+# ---- edge auto-scroll ------------------------------------------------------
+# Holding a time-axis drag inside a narrow band at either end of the visible
+# track pans the viewport, so a long move no longer needs drop / scroll / drag
+# again. Values are per-tick pixel amounts at EDGE_SCROLL_INTERVAL_MS.
+EDGE_SCROLL_ZONE_PX = 44
+EDGE_SCROLL_INTERVAL_MS = 16
+EDGE_SCROLL_MIN_PX = 2
+EDGE_SCROLL_MAX_PX = 24
+
+
+def edge_scroll_delta(rel_x: int, viewport_width: int) -> int:
+    """Signed horizontal scroll for one tick, or 0 outside the edge zones.
+
+    ``rel_x`` is the pointer x *relative to the left of the visible track*, so
+    it may go negative (or past ``viewport_width``) while the drag still holds
+    the mouse grab. Speed ramps linearly from ``EDGE_SCROLL_MIN_PX`` at the
+    inner lip of the zone to ``EDGE_SCROLL_MAX_PX`` at the viewport edge and is
+    capped there, so a pointer parked far outside cannot run away.
+
+    On a viewport too narrow for two full zones each zone shrinks to half the
+    width, which keeps the two branches mutually exclusive.
+    """
+    if viewport_width < 2:
+        return 0
+    zone = min(EDGE_SCROLL_ZONE_PX, viewport_width // 2)
+    if zone <= 0:
+        return 0
+    if rel_x < zone:
+        direction, penetration = -1, zone - rel_x
+    elif rel_x > viewport_width - zone:
+        direction, penetration = 1, rel_x - (viewport_width - zone)
+    else:
+        return 0
+    frac = min(1.0, max(0.0, penetration / zone))
+    speed = EDGE_SCROLL_MIN_PX + (EDGE_SCROLL_MAX_PX - EDGE_SCROLL_MIN_PX) * frac
+    return direction * int(round(speed))
 
 
 @dataclass
@@ -129,6 +168,14 @@ class TimelineWidget(QWidget):
         self._added_audios: list[AddedAudio] = []
         self._added_audio_replace: bool = False
         self._added_audio_selected_id: str = ""
+
+        # Edge auto-scroll: one timer for the widget's whole lifetime, one
+        # connection, and the last *widget-local* pointer position so a tick
+        # can replay the active drag against the panned viewport.
+        self._drag_pos: QPoint | None = None
+        self._autoscroll_timer = QTimer(self)
+        self._autoscroll_timer.setInterval(EDGE_SCROLL_INTERVAL_MS)
+        self._autoscroll_timer.timeout.connect(self._edge_autoscroll_tick)
 
     # ---- audio-lane management ----------------------------------------
 
@@ -956,14 +1003,24 @@ class TimelineWidget(QWidget):
     def mousePressEvent(self, event: QMouseEvent) -> None:
         pos = event.position().toPoint()
         if event.button() == Qt.RightButton:
+            # `QMenu.exec()` spins a nested event loop, which would keep
+            # servicing auto-scroll ticks - and so keep editing - behind the
+            # menu. Disarm first; the drag itself is untouched.
+            self._stop_edge_autoscroll()
             self._show_context_menu(event.globalPosition().toPoint(), pos)
             return
         if event.button() != Qt.LeftButton:
             return
 
+        # A fresh gesture never inherits the previous one's pointer or
+        # auto-scroll direction.
+        self._autoscroll_timer.stop()
+        self._drag_pos = None
+
         shift_held = bool(event.modifiers() & Qt.ShiftModifier)
         hit = self._hit_test(pos)
         hit.press_x = pos.x()
+        hit.press_y = pos.y()
 
         # Any press that isn't a click on the added-audio tile clears the
         # added-audio selection highlight.
@@ -989,7 +1046,8 @@ class TimelineWidget(QWidget):
         # Shift anywhere → region-select regardless of what's under the cursor.
         if shift_held and hit.mode != "seek":
             t = self._x_to_time(pos.x())
-            self._drag = _Drag(mode="select", anchor_t=t, press_x=pos.x())
+            self._drag = _Drag(mode="select", anchor_t=t,
+                               press_x=pos.x(), press_y=pos.y())
             self._set_selection_span(t, t)
             self.update()
             return
@@ -1001,7 +1059,8 @@ class TimelineWidget(QWidget):
             return
         if hit.mode == "playhead_region":
             t = self._playhead
-            self._drag = _Drag(mode="select", anchor_t=t, press_x=pos.x())
+            self._drag = _Drag(mode="select", anchor_t=t,
+                               press_x=pos.x(), press_y=pos.y())
             self._set_selection_span(t, t)
             self.update()
             return
@@ -1027,7 +1086,7 @@ class TimelineWidget(QWidget):
                 mode="move_added",
                 clip_id=audio.id,
                 grab_offset_s=self._x_to_time(pos.x()) - audio.offset,
-                press_x=pos.x(),
+                press_x=pos.x(), press_y=pos.y(),
             )
             self.update()
             return
@@ -1057,7 +1116,7 @@ class TimelineWidget(QWidget):
                 self._drag = _Drag(
                     mode="move_audio", clip_id=c.id,
                     grab_offset_s=self._x_to_time(pos.x()) - (c.timeline_start + c.audio_offset),
-                    press_x=pos.x(),
+                    press_x=pos.x(), press_y=pos.y(),
                 )
                 self.update()
                 return
@@ -1070,13 +1129,14 @@ class TimelineWidget(QWidget):
                     mode="move_clip", clip_id=c.id,
                     original_clip_start=c.timeline_start,
                     grab_offset_s=self._x_to_time(pos.x()) - c.timeline_start,
-                    press_x=pos.x(),
+                    press_x=pos.x(), press_y=pos.y(),
                 )
                 return
 
         # empty area drag → region select
         t = self._x_to_time(pos.x())
-        self._drag = _Drag(mode="select", anchor_t=t, press_x=pos.x())
+        self._drag = _Drag(mode="select", anchor_t=t,
+                           press_x=pos.x(), press_y=pos.y())
         self._set_selection_span(t, t)
         self.update()
 
@@ -1116,6 +1176,25 @@ class TimelineWidget(QWidget):
                 or abs(pos.y() - self._drag.press_y) > CLICK_SLOP_PX):
             self._drag.moved = True
 
+        self._drag_pos = pos
+        self._apply_drag_at(pos)
+        self._update_edge_autoscroll()
+
+    # Time-axis drags that edge auto-scroll assists. "seek" is deliberately
+    # absent: `set_playhead()` already pans the view via `_ensure_visible()`,
+    # so a second scroll source would compound. "resize_tracks" is vertical.
+    _EDGE_SCROLL_MODES = frozenset({
+        "select", "move_clip", "move_audio", "move_added",
+        "trim_l", "trim_r", "trim_added_l", "trim_added_r",
+    })
+
+    def _apply_drag_at(self, pos: QPoint) -> None:
+        """Recalculate the active drag for a widget-local pointer position.
+
+        The single authoritative drag-application path: real pointer movement
+        and edge auto-scroll ticks both land here, so a tick that only changed
+        `_scroll_x` still moves the dragged object to the timeline time now
+        sitting under the (physically stationary) pointer."""
         t = self._x_to_time(pos.x())
         if self._drag.mode == "seek":
             self.set_playhead(t)
@@ -1181,7 +1260,118 @@ class TimelineWidget(QWidget):
                 self._refresh_min_height()
                 self.update()
 
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+    # ---- edge auto-scroll ---------------------------------------------
+
+    def _edge_scroll_step(self) -> int:
+        """Per-tick scroll for the current drag; 0 when auto-scroll must not
+        run - no supported drag, no remembered pointer, pointer away from the
+        edges, or no room left to scroll that way."""
+        if self._drag.mode not in self._EDGE_SCROLL_MODES:
+            return 0
+        if not self._drag.moved:
+            # Respect the existing click-slop threshold: jitter inside a click
+            # near an edge must not pan the view (and, via the replay, turn
+            # itself into a real edit).
+            return 0
+        pos = self._drag_pos
+        if pos is None:
+            return 0
+        tr = self._track_rect()
+        delta = edge_scroll_delta(pos.x() - tr.left(), tr.width())
+        if delta < 0 and self._scroll_x <= 0:
+            return 0
+        if delta > 0 and self._scroll_x >= self.scroll_max_px():
+            return 0
+        return delta
+
+    def _update_edge_autoscroll(self) -> None:
+        """Single arm/disarm decision point, re-evaluated after every pointer
+        move and every tick."""
+        if self._edge_scroll_step() != 0:
+            if not self._autoscroll_timer.isActive():
+                self._autoscroll_timer.start()
+        else:
+            self._autoscroll_timer.stop()
+
+    def _edge_autoscroll_tick(self) -> None:
+        step = self._edge_scroll_step()
+        if step == 0:
+            self._autoscroll_timer.stop()
+            return
+        before = self._scroll_x
+        # Route through the Tab 2A clamp: `_publish_scroll_range()` folds the
+        # candidate back into [0, scroll_max_px()] and notifies the scrollbar.
+        # `scroll_max_px()` is recomputed there, so a resize or a range change
+        # mid-drag can never be outrun by a stale maximum.
+        self._scroll_x = self._clamped_scroll_x(self._scroll_x + step)
+        self._publish_scroll_range()
+        if self._scroll_x == before:
+            self._autoscroll_timer.stop()
+            return
+        pos = self._drag_pos
+        if pos is not None:
+            self._apply_drag_at(pos)
+        self.update()
+        self._update_edge_autoscroll()
+
+    def _stop_edge_autoscroll(self) -> None:
+        """Disarm auto-scroll and forget the pointer, without touching the
+        drag itself. Auto-scroll is viewport state only."""
+        self._autoscroll_timer.stop()
+        self._drag_pos = None
+
+    def _end_drag(self) -> None:
+        """Single teardown for every drag exit path."""
+        self._stop_edge_autoscroll()
+        self._drag = _Drag()
+
+    #: Input-stream endings that are not a mouse release. Qt only guarantees
+    #: `mouseReleaseEvent()` while the implicit mouse grab is held, so once it
+    #: is lost (a popup steals it, the window deactivates) the drag is orphaned
+    #: and nothing else would ever stop the auto-scroll timer.
+    _ORPHAN_DRAG_EVENTS = (QEvent.Type.UngrabMouse, QEvent.Type.WindowDeactivate)
+
+    def _abandon_orphaned_drag(self) -> None:
+        """Finish a drag whose input stream stopped without a release.
+
+        Terminating is not enough: the widget owns *clones* of the added-audio
+        entries, so an added-audio move or trim that never emits its commit
+        signal is silently discarded the next time the app republishes. The
+        orphan therefore runs the same `_finalize_drag()` the release would
+        have run - same commit, same normalization, same single snapshot -
+        and only then tears the drag down. Nothing is rolled back.
+
+        Idempotent: `_finalize_drag()` is a no-op once the drag is cleared, so
+        a release that still arrives afterwards commits nothing further.
+        """
+        if not self._drag.mode:
+            return
+        self._finalize_drag()
+        self._end_drag()
+
+    def event(self, event) -> bool:  # noqa: ANN001
+        if event.type() in self._ORPHAN_DRAG_EVENTS:
+            self._abandon_orphaned_drag()
+        return super().event(event)
+
+    def hideEvent(self, event) -> None:  # noqa: ANN001
+        # Nothing may keep ticking behind a hidden widget. The drag itself is
+        # deliberately left alone: tearing it down here would abandon an
+        # in-progress edit without the commit `mouseReleaseEvent()` performs.
+        self._stop_edge_autoscroll()
+        super().hideEvent(event)
+
+    def _finalize_drag(self) -> None:
+        """Commit the active drag with its mode-specific release semantics.
+
+        The single authoritative finalization path, shared by an ordinary
+        `mouseReleaseEvent()` and by an abnormal termination (`UngrabMouse` /
+        `WindowDeactivate`). It emits exactly the one commit signal that drag
+        earns - which is what drives the app's single `_snapshot()` - and runs
+        the same normalization (overlap resolution, re-sort, trailing lane).
+
+        No-op once `_drag.mode` is empty, so a release arriving after an
+        orphan has already been finalized commits nothing a second time."""
         mode = self._drag.mode
         if mode in ("trim_l", "trim_r"):
             c = self._find(self._drag.clip_id)
@@ -1223,7 +1413,10 @@ class TimelineWidget(QWidget):
             else:
                 # bare click on empty area → clear any old selection
                 self.clear_selection()
-        self._drag = _Drag()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        self._finalize_drag()
+        self._end_drag()
 
     def wheelEvent(self, event: QWheelEvent) -> None:
         # Plain wheel zooms horizontally around the cursor; shift+wheel scrolls.
