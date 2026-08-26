@@ -208,6 +208,70 @@ def plan_ripple_move(
     return plan
 
 
+def plan_close_gap_left(
+    clips: list[Clip],
+    clip_id: str,
+) -> dict[str, float] | None:
+    """Work out where every visual clip lands when the empty gap immediately
+    before `clip_id` is closed, or return None when there is no gap.
+
+    Pure position math, split out of the widget/undo wiring the same way
+    `plan_ripple_move` is, so the rule can be tested without a window.
+
+    The rule is deliberately narrow: exactly the one gap in front of the
+    clip is removed, and the clip plus everything after it translates left
+    by that amount. Relative spacing inside that suffix is preserved, so a
+    deliberate gap further along the sequence survives untouched, and clips
+    before the selected one never move.
+    """
+    ordered = sort_clips(clips)
+    idx = next((i for i, c in enumerate(ordered) if c.id == clip_id), None)
+    if idx is None:
+        return None
+    prev_end = ordered[idx - 1].timeline_end if idx > 0 else 0.0
+    gap = ordered[idx].timeline_start - prev_end
+    if gap <= _CUT_EPS:
+        # Already butted against the previous clip (or against t=0). No
+        # mutation and no undo entry, and float noise below the shared
+        # tolerance is not a gap.
+        return None
+    return {
+        c.id: (c.timeline_start - gap if i >= idx else c.timeline_start)
+        for i, c in enumerate(ordered)
+    }
+
+
+def plan_ripple_delete(
+    clips: list[Clip],
+    clip_id: str,
+) -> dict[str, float] | None:
+    """Work out where the surviving visual clips land when `clip_id` is
+    deleted and the time it occupied is closed, or return None when there
+    is no such clip.
+
+    The rule is exactly one subtraction: only the deleted clip's own
+    occupied duration leaves the timeline, so every clip that started after
+    it translates left by that duration and nothing else is renegotiated.
+    Gaps that were not part of the removed span - a leading gap in front of
+    the deleted clip, or any gap between later clips - survive translated,
+    never collapsed.
+
+    The deleted clip is absent from the returned plan; deleting the only
+    clip therefore yields an empty (but not None) plan.
+    """
+    clip = next((c for c in clips if c.id == clip_id), None)
+    if clip is None:
+        return None
+    length = clip.timeline_length
+    old = clip.timeline_start
+    return {
+        c.id: (max(0.0, c.timeline_start - length)
+               if c.timeline_start > old + _CUT_EPS else c.timeline_start)
+        for c in clips
+        if c.id != clip_id
+    }
+
+
 # ── Inline icon painters for transport / zoom buttons ──────────────────────
 # Avoiding an external icon file keeps the install footprint small and lets
 # icons inherit the current palette color on hover. The shapes match the
@@ -1004,6 +1068,8 @@ class MainWindow(QMainWindow):
         self.timeline.clipDeleteRequested.connect(self._on_clip_delete_requested)
         self.timeline.clipMoveToStartRequested.connect(self._on_clip_move_to_start)
         self.timeline.clipMoveToPlayheadRequested.connect(self._on_clip_move_to_playhead)
+        self.timeline.clipCloseGapLeftRequested.connect(self._on_clip_close_gap_left)
+        self.timeline.clipRippleDeleteRequested.connect(self._on_clip_ripple_delete)
         self.timeline.audioOffsetChanged.connect(self._on_audio_offset_changed)
         self.timeline.clipAudioRemoveRequested.connect(self._on_clip_audio_remove_requested)
         self.timeline.scrollRangeChanged.connect(self._on_timeline_scroll_range)
@@ -1022,6 +1088,13 @@ class MainWindow(QMainWindow):
         self.timeline_scrollbar.setMinimumWidth(120)
         self.timeline_scrollbar.valueChanged.connect(self.timeline.set_scroll_x)
         sb_row.addWidget(self.timeline_scrollbar, stretch=1)
+
+        # Orientation escape hatch for long edits: put the whole sequence
+        # back in view without wheeling across it.
+        self.zoom_fit_btn = QPushButton("Fit")
+        self.zoom_fit_btn.setToolTip("Zoom to fit the whole sequence in view")
+        self.zoom_fit_btn.clicked.connect(self.timeline.zoom_to_fit)
+        sb_row.addWidget(self.zoom_fit_btn)
 
         self.zoom_out_btn = _make_zoom_btn("minus", "Zoom out (Shift+Scroll also scrolls)")
         self.zoom_out_btn.clicked.connect(self._zoom_out_clicked)
@@ -2101,14 +2174,7 @@ class MainWindow(QMainWindow):
         if plan is None:
             return
         self._snapshot()
-        for c in self._clips:
-            new_start = plan[c.id]
-            if not c.linked_audio:
-                # Detached clip audio is pinned to absolute timeline time,
-                # exactly as dragging a clip already treats it. Compensate
-                # the offset so a ripple never slides it out of sync.
-                c.audio_offset += c.timeline_start - new_start
-            c.timeline_start = new_start
+        self._apply_start_plan(plan)
         self._clips = sort_clips(self._clips)
         self.timeline.set_clips(self._clips)
         self.timeline.select_clip(clip_id)
@@ -2117,14 +2183,77 @@ class MainWindow(QMainWindow):
         self._drive_main_player_from_playhead()
         self.status.showMessage("Clip moved.", 2000)
 
+    def _apply_start_plan(self, plan: dict[str, float]) -> None:
+        """Write the new timeline starts from a position plan.
+
+        Detached clip audio is pinned to absolute timeline time, exactly as
+        dragging a clip already treats it. Compensate the offset so no plan
+        - ripple move, gap close or ripple delete - slides it out of sync.
+        Clips missing from the plan keep their current position.
+        """
+        for c in self._clips:
+            if c.id not in plan:
+                continue
+            new_start = plan[c.id]
+            if not c.linked_audio:
+                c.audio_offset += c.timeline_start - new_start
+            c.timeline_start = new_start
+
+    def _on_clip_close_gap_left(self, clip_id: str) -> None:
+        """Close the empty gap immediately before a visual clip.
+
+        One undoable action: the clip and everything after it slide left by
+        exactly the gap width, so deliberate gaps further along survive.
+        AddedAudio is untouched - it is an independent absolute-time layer
+        with no stored link to any clip.
+        """
+        plan = plan_close_gap_left(self._clips, clip_id)
+        if plan is None:
+            self.status.showMessage("No gap to close.", 2000)
+            return
+        self._snapshot()
+        self._apply_start_plan(plan)
+        self._clips = sort_clips(self._clips)
+        self.timeline.set_clips(self._clips)
+        self.timeline.select_clip(clip_id)
+        self._sync_selected_clip_ui()
+        self._update_range_label()
+        self._drive_main_player_from_playhead()
+        self.status.showMessage("Gap closed.", 2000)
+
     def _on_clip_delete_requested(self, clip_id: str) -> None:
         self._delete_clip_by_id(clip_id)
 
-    def _delete_clip_by_id(self, clip_id: str) -> None:
+    def _on_clip_ripple_delete(self, clip_id: str) -> None:
+        """Delete a visual clip and close the time it occupied.
+
+        Distinct from ordinary Delete, which leaves the vacated span as a
+        gap. Both share `_delete_clip_by_id()` so the "last clip removed"
+        cleanup (preview, playback, export enablement) is not duplicated;
+        the only difference is the position plan handed to it, which makes
+        this one undoable action rather than a delete plus a move.
+        """
+        plan = plan_ripple_delete(self._clips, clip_id)
+        if plan is None:
+            return
+        self._delete_clip_by_id(
+            clip_id, start_plan=plan,
+            message="Clip ripple-deleted; gap closed.",
+        )
+        self._drive_main_player_from_playhead()
+
+    def _delete_clip_by_id(self, clip_id: str, *,
+                           start_plan: dict[str, float] | None = None,
+                           message: str = "Clip deleted.") -> None:
         if not any(c.id == clip_id for c in self._clips):
             return
         self._snapshot()
         self._clips = [cc for cc in self._clips if cc.id != clip_id]
+        if start_plan is not None:
+            # Ripple variant: reposition the survivors inside the same
+            # snapshot so undo restores the clip and the layout in one step.
+            self._apply_start_plan(start_plan)
+            self._clips = sort_clips(self._clips)
         self.timeline.set_clips(self._clips)
         self._sync_selected_clip_ui()
         self._update_range_label()
@@ -2135,7 +2264,7 @@ class MainWindow(QMainWindow):
             first = self._clips[0]
             self._set_preview_clip(first)
             self.timeline.select_clip(first.id)
-        self.status.showMessage("Clip deleted.", 2500)
+        self.status.showMessage(message, 2500)
 
     def _halt_playback_no_clips(self) -> None:
         """Called when the timeline's clip list emptied out. Stops the

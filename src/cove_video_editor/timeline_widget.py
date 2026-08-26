@@ -58,6 +58,10 @@ RIGHT_PAD = 8
 HANDLE_W = 8
 MIN_PPS = 5.0
 MAX_PPS = 800.0
+# Trailing breathing room past the end of the content, in seconds. The
+# scroll range has always granted this, so Zoom to Fit fits it too rather
+# than inventing a second, different margin.
+SCROLL_TAIL_PAD_S = 2.0
 CLICK_SLOP_PX = 5
 CHAIN_BTN_W = 22
 CHAIN_BTN_H = 18
@@ -138,6 +142,8 @@ class TimelineWidget(QWidget):
     clipDeleteRequested = Signal(str)             # clip id
     clipMoveToStartRequested = Signal(str)        # clip id - ripple to t=0
     clipMoveToPlayheadRequested = Signal(str)     # clip id - ripple to playhead
+    clipCloseGapLeftRequested = Signal(str)       # clip id - close the gap in front
+    clipRippleDeleteRequested = Signal(str)       # clip id - delete + close its span
     audioOffsetChanged = Signal(str, float)       # clip id, new audio_offset (seconds)
     clipAudioRemoveRequested = Signal(str)        # clip id — delete clip's audio only
     scrollRangeChanged = Signal(int, int)         # scroll_max, page (in px)
@@ -266,6 +272,26 @@ class TimelineWidget(QWidget):
     def pixels_per_second(self) -> float:
         return self._pps
 
+    def zoom_to_fit(self) -> None:
+        """Size the zoom so the whole timeline extent fits the visible track
+        width, then send the viewport back to the start.
+
+        An orientation/recovery command for long edits, so it only ever
+        zooms out: a sequence already narrower than the viewport keeps the
+        user's current zoom instead of being blown up to fill the space.
+        `_total_length()` stays the single authoritative definition of the
+        extent, so added audio running past the last clip is included, and
+        the scroll write goes through the Tab 2A clamp.
+        """
+        target = fit_pixels_per_second(
+            self._total_length(), self._track_rect().width(), self._pps,
+        )
+        if target is not None:
+            self.set_pixels_per_second(target)
+        self.set_scroll_x(0)
+        self._publish_scroll_range()
+        self.update()
+
     # Expose zoom bounds so the app's zoom bar maps to the same range.
     PPS_MIN = MIN_PPS
     PPS_MAX = MAX_PPS
@@ -347,7 +373,7 @@ class TimelineWidget(QWidget):
         return max(0, min(int(x), self.scroll_max_px()))
 
     def scroll_max_px(self) -> int:
-        total = max(self._total_length() + 2.0, 0.1)
+        total = max(self._total_length() + SCROLL_TAIL_PAD_S, 0.1)
         track_w = max(1, self._track_rect().width())
         max_x = max(0, int(total * self._pps) - track_w)
         return max_x
@@ -1623,12 +1649,19 @@ class TimelineWidget(QWidget):
         audio_volume_action = None
         move_start_action = None
         move_playhead_action = None
+        close_gap_action = None
+        ripple_delete_action = None
         if clicked_clip is not None:
             menu.addSeparator()
             # Zero-drag repositioning: the way back from a leading gap left
             # by head-trimming, without dragging across a long sequence.
             move_start_action = menu.addAction("Move to Start")
             move_playhead_action = menu.addAction("Move to Playhead")
+            # Explicit gap cleanup on the clip that was actually right-clicked.
+            close_gap_action = menu.addAction("Close Gap Left")
+            # Distinct from the plain delete on the Delete key, which leaves
+            # the vacated span behind as a gap.
+            ripple_delete_action = menu.addAction("Ripple Delete")
             clip_volume_action = menu.addAction("Volume...")
         if clicked_audio is not None:
             menu.addSeparator()
@@ -1664,6 +1697,12 @@ class TimelineWidget(QWidget):
             return
         if move_playhead_action is not None and chosen is move_playhead_action:
             self.clipMoveToPlayheadRequested.emit(clicked_clip.id)
+            return
+        if close_gap_action is not None and chosen is close_gap_action:
+            self.clipCloseGapLeftRequested.emit(clicked_clip.id)
+            return
+        if ripple_delete_action is not None and chosen is ripple_delete_action:
+            self.clipRippleDeleteRequested.emit(clicked_clip.id)
             return
         if clip_volume_action is not None and chosen is clip_volume_action:
             self.clipDoubleClicked.emit(clicked_clip.id)
@@ -1766,6 +1805,30 @@ class TimelineWidget(QWidget):
     def sizeHint(self) -> QSize:
         audio_total = sum(self._audio_lane_heights) + TRACK_GAP * len(self._audio_lane_heights)
         return QSize(900, RULER_H + TRACK_GAP + self._video_h + audio_total + 4)
+
+
+def fit_pixels_per_second(
+    total_length: float,
+    track_width: int,
+    current_pps: float,
+) -> float | None:
+    """Return the zoom that makes `total_length` seconds (plus the trailing
+    pad the scroll range already grants) fit `track_width` pixels, or None
+    when there is nothing to fit.
+
+    Pure math, split out of the widget so the policy is testable without
+    geometry. Two rules beyond the division:
+
+    * it never zooms *in* - `min(current_pps, ...)` keeps this an
+      orientation command rather than a "maximise the clip" one, so a short
+      project is left at the zoom the user chose;
+    * it never leaves the existing zoom bounds. A project too long to fit
+      even at `MIN_PPS` lands on that legal minimum and stays scrollable.
+    """
+    if total_length <= 0.0 or track_width <= 0:
+        return None
+    raw = track_width / (total_length + SCROLL_TAIL_PAD_S)
+    return max(MIN_PPS, min(MAX_PPS, min(current_pps, raw)))
 
 
 def _choose_tick_step(pps: float) -> float:
