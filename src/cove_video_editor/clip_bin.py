@@ -10,7 +10,7 @@ In 2.0 the tab labels include live counts: e.g. ``Audio Files (1)``,
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QMimeData, QPointF, QRect, QSize, Qt, Signal
+from PySide6.QtCore import QMimeData, QPoint, QPointF, QRect, QSize, Qt, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -41,12 +41,22 @@ from .clip import MediaAsset
 
 ASSET_MIME = "application/x-cove-asset-id"
 
+# How far the pointer may travel between press and release and still count
+# as a click on empty space (rather than the start of a drag). Small enough
+# that a real drag never opens the picker, loose enough that hand jitter on
+# a click still does.
+BROWSE_CLICK_SLOP_PX = 6
+
 
 class AssetList(QListWidget):
     """Icon-grid list with drag-to-timeline AND drag-from-OS support."""
 
     deleteRequested = Signal(str)        # asset id
     filesDropped = Signal(list)          # list[str]
+    browseRequested = Signal()           # empty area clicked - open a picker
+
+    # Empty-state hint: both ways to get media in.
+    EMPTY_HINT = ("Click to browse for files", "or drop files or folders here")
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -79,6 +89,38 @@ class AssetList(QListWidget):
             f" color:{theme.TEXT}; }}"
         )
         self._drop_highlight = False
+        self._press_on_empty = False
+        self._press_pos = QPoint()
+
+    # --- click empty area to browse -------------------------------------
+
+    def mousePressEvent(self, event) -> None:  # noqa: ANN001
+        # Remember where an empty-area left-press started so a plain click
+        # (no drag) can open the file picker on release. Presses on an item,
+        # or with any other button, never arm it.
+        pos = event.position().toPoint()
+        self._press_on_empty = (
+            event.button() == Qt.LeftButton and self.itemAt(pos) is None
+        )
+        self._press_pos = pos
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: ANN001
+        armed = self._press_on_empty
+        # One release consumes the press either way, so a stray second
+        # release cannot fire a second browse.
+        self._press_on_empty = False
+        pos = event.position().toPoint()
+        if (
+            armed
+            and event.button() == Qt.LeftButton
+            and self.itemAt(pos) is None
+            and (pos - self._press_pos).manhattanLength() < BROWSE_CLICK_SLOP_PX
+        ):
+            self.browseRequested.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     # --- key handling ---------------------------------------------------
 
@@ -198,12 +240,12 @@ class AssetList(QListWidget):
             p.setPen(theme.C_TEXT_2 if not self._drop_highlight else theme.C_ACCENT)
             f = p.font(); f.setPointSize(10); p.setFont(f)
             text_rect = QRect(0, cy + box_h // 2 - 10, vp.width(), 40)
-            p.drawText(text_rect, Qt.AlignHCenter | Qt.AlignTop, "Drop files or folders")
+            p.drawText(text_rect, Qt.AlignHCenter | Qt.AlignTop, self.EMPTY_HINT[0])
             p.setPen(theme.C_TEXT_3)
             p.drawText(
                 QRect(0, cy + box_h // 2 + 10, vp.width(), 24),
                 Qt.AlignHCenter | Qt.AlignTop,
-                "or drag onto the timeline",
+                self.EMPTY_HINT[1],
             )
         p.end()
 
@@ -219,7 +261,8 @@ class ClipBin(QWidget):
     assetActivated = Signal(str)            # double-click
     assetDeleteRequested = Signal(str)      # Delete / Backspace on an asset
     subDeleteRequested = Signal(str)        # Delete / Backspace on a subtitle row
-    filesDropped = Signal(list)             # list[str] — dropped from OS
+    filesDropped = Signal(list)             # list[str] - dropped from OS
+    browseRequested = Signal(str)           # kind ("video"/"audio"/"image"/"sub")
     subActivated = Signal(str)              # subtitle id (double-click = make active)
     subStyleRequested = Signal()            # open style dialog
     subSyncRequested = Signal()             # open auto-sync / offset dialog
@@ -257,10 +300,15 @@ class ClipBin(QWidget):
         self.video_list = AssetList()
         self.audio_list = AssetList()
         self.image_list = AssetList()
-        for lst in (self.video_list, self.audio_list, self.image_list):
+        for lst, kind in (
+            (self.video_list, "video"),
+            (self.audio_list, "audio"),
+            (self.image_list, "image"),
+        ):
             lst.itemDoubleClicked.connect(self._on_activated)
             lst.deleteRequested.connect(self.assetDeleteRequested)
             lst.filesDropped.connect(self.filesDropped)
+            lst.browseRequested.connect(lambda k=kind: self.browseRequested.emit(k))
         # Subs tab: a list of uploaded .srt/.vtt files with a small style
         # button up top. The AssetList for subs emits `deleteRequested` via
         # a dedicated signal so app.py can distinguish sub deletions from
@@ -269,6 +317,7 @@ class ClipBin(QWidget):
         self.subs_list.itemDoubleClicked.connect(self._on_sub_activated)
         self.subs_list.deleteRequested.connect(self.subDeleteRequested)
         self.subs_list.filesDropped.connect(self.filesDropped)
+        self.subs_list.browseRequested.connect(lambda: self.browseRequested.emit("sub"))
         self._sub_tab = self._build_subs_tab()
 
         # Keep references so we can relabel based on item counts. Short

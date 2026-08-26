@@ -107,15 +107,99 @@ from .thumbnails import start_thumbnails, start_waveform
 from .timeline_widget import TimelineWidget
 
 
-VIDEO_FILTERS = (
-    "Videos (*.mp4 *.mkv *.webm *.mov *.avi *.m4v *.mpg *.mpeg *.wmv);;All files (*)"
-)
-AUDIO_FILTERS = "Audio (*.mp3 *.m4a *.aac *.wav *.ogg *.opus *.flac);;All files (*)"
-IMAGE_FILTERS = "Images (*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tiff *.tif);;All files (*)"
-SUB_FILTERS = "Subtitles (*.srt *.vtt *.ass *.ssa);;All files (*)"
+# The extension sets are the single source of truth for "media Cove can
+# import": the file-picker filters below are generated from them, and
+# `_expand_media_paths` uses the same sets to decide what to pull out of a
+# dropped folder. Keep them in sync by editing only the sets.
+VIDEO_EXTS = {
+    ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".mpg", ".mpeg", ".wmv",
+    # Common containers ffmpeg opens happily; listed so a folder import (and
+    # the picker filter) does not silently skip them.
+    ".ts", ".m2ts", ".mts", ".flv", ".3gp", ".ogv",
+}
 AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".wav", ".ogg", ".opus", ".flac"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tiff", ".tif"}
 SUB_EXTS = {".srt", ".vtt", ".ass", ".ssa"}
+# Every extension the library can import.
+MEDIA_EXTS = VIDEO_EXTS | AUDIO_EXTS | IMAGE_EXTS | SUB_EXTS
+# Importing a folder can pull in a lot of files, and each video/audio needs
+# an ffmpeg probe, so a big folder takes a while. Ask before importing more
+# than this many supported files in one batch.
+FOLDER_IMPORT_WARN_THRESHOLD = 50
+
+
+def _ext_filter(label: str, exts: set[str]) -> str:
+    """`"Videos (*.avi *.mp4 ...)"` for a QFileDialog name filter."""
+    return f"{label} (" + " ".join(f"*{e}" for e in sorted(exts)) + ")"
+
+
+VIDEO_FILTERS = _ext_filter("Videos", VIDEO_EXTS) + ";;All files (*)"
+AUDIO_FILTERS = _ext_filter("Audio", AUDIO_EXTS) + ";;All files (*)"
+IMAGE_FILTERS = _ext_filter("Images", IMAGE_EXTS) + ";;All files (*)"
+SUB_FILTERS = _ext_filter("Subtitles", SUB_EXTS) + ";;All files (*)"
+# "All media" combines every supported extension so one browse can pick any
+# file type; the clicked tab's own kind is offered first.
+ALL_MEDIA_FILTER = _ext_filter("All media", MEDIA_EXTS)
+
+
+def _name_sort_key(name: str) -> tuple[str, str]:
+    """Case-insensitive first, then the raw name as a tie-breaker so
+    `A.mp4` / `a.mp4` in the same folder still get a total order instead of
+    falling back to filesystem enumeration order."""
+    return (name.lower(), name)
+
+
+def _expand_media_paths(paths) -> list[Path]:
+    """Flatten a mix of files and folders into the media files to import.
+
+    Folders are walked recursively and only extensions the library knows
+    are kept, so dropping a project folder does not drag in unrelated
+    files. Pure: no dialogs, no UI, no ffmpeg probing.
+
+    Behaviour worth pinning down:
+
+    * Ordering is deterministic - the caller's order is preserved, and
+      each directory contributes its own files (sorted case-insensitively)
+      before descending into its subdirectories (also sorted). Filesystem
+      enumeration order is never relied on.
+    * Directory symlinks are not followed (``os.walk(followlinks=False)``),
+      so a symlink cycle cannot make the walk run forever.
+    * Duplicates within the one batch are collapsed, keeping the first
+      occurrence, so "a folder plus one of its files" imports it once.
+      Comparison is by absolute path (case-folded where the platform is
+      case-insensitive); no hashing, no metadata reads.
+    * Paths that do not exist - or that raise while being inspected - are
+      skipped rather than raising.
+    """
+    out: list[Path] = []
+    seen: set[str] = set()
+
+    def _keep(p: Path) -> None:
+        key = os.path.normcase(os.path.abspath(str(p)))
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(p)
+
+    for p in paths:
+        try:
+            if p.is_dir():
+                for root, dirnames, filenames in os.walk(p, followlinks=False):
+                    dirnames.sort(key=_name_sort_key)
+                    root_path = Path(root)
+                    for name in sorted(filenames, key=_name_sort_key):
+                        f = root_path / name
+                        # `is_file()` also keeps symlinks to regular files
+                        # but rejects FIFOs, sockets and devices: a
+                        # media-named FIFO would block the synchronous
+                        # ffprobe forever.
+                        if f.suffix.lower() in MEDIA_EXTS and f.is_file():
+                            _keep(f)
+            elif p.is_file() and p.suffix.lower() in MEDIA_EXTS:
+                _keep(p)
+        except OSError:
+            continue
+    return out
 
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 ICON_PATH = ASSETS_DIR / "cove_icon.png"
@@ -874,6 +958,7 @@ class MainWindow(QMainWindow):
         self.clip_bin.assetActivated.connect(self._on_asset_activated)
         self.clip_bin.assetDeleteRequested.connect(self._on_asset_delete_requested)
         self.clip_bin.filesDropped.connect(self._on_bin_files_dropped)
+        self.clip_bin.browseRequested.connect(self._on_browse_requested)
         self.clip_bin.subActivated.connect(self._on_sub_activated)
         self.clip_bin.subDeleteRequested.connect(self._on_sub_delete_requested)
         self.clip_bin.subStyleRequested.connect(self._on_sub_style_requested)
@@ -1249,7 +1334,10 @@ class MainWindow(QMainWindow):
             event.acceptProposedAction()
             return
         if md.hasUrls():
-            paths = [Path(u.toLocalFile()) for u in md.urls() if u.toLocalFile()]
+            dropped = [Path(u.toLocalFile()) for u in md.urls() if u.toLocalFile()]
+            # Expand any dropped folders into the media files they hold,
+            # and confirm the batch before anything is imported.
+            paths = self._prepare_import_batch(dropped)
             audio_paths = [p for p in paths if p.suffix.lower() in AUDIO_EXTS]
             other_paths = [p for p in paths if p.suffix.lower() not in AUDIO_EXTS]
             if other_paths:
@@ -1593,9 +1681,68 @@ class MainWindow(QMainWindow):
         self._refresh_subtitle_overlay()
 
     def _on_bin_files_dropped(self, paths: list) -> None:
-        # Import into the library only — don't auto-append videos to the
+        # Import into the library only - don't auto-append videos to the
         # timeline. User drags to timeline explicitly when they want them.
-        self._import_paths([Path(p) for p in paths if p], append_to_timeline=False)
+        files = self._prepare_import_batch([Path(p) for p in paths if p])
+        if files:
+            self._import_paths(files, append_to_timeline=False)
+
+    # --- browse / batch import ----------------------------------------
+
+    def _prepare_import_batch(self, paths: list[Path]) -> list[Path]:
+        """Turn a raw list of dropped/selected paths into the media files
+        to import: folders expanded recursively, unsupported files dropped,
+        duplicates collapsed, and a big batch confirmed with the user
+        first. Returns an empty list when there is nothing to import or the
+        user cancelled - nothing is imported until this returns non-empty,
+        so no assets exist before the confirmation is answered."""
+        files = _expand_media_paths(paths)
+        if not files:
+            return []
+        if not self._confirm_bulk_import(len(files)):
+            return []
+        return files
+
+    def _confirm_bulk_import(self, count: int) -> bool:
+        """Ask before importing a large batch (e.g. a big folder). Small
+        imports proceed silently. Returns True to go ahead."""
+        if count <= FOLDER_IMPORT_WARN_THRESHOLD:
+            return True
+        reply = QMessageBox.question(
+            self,
+            "Import many files?",
+            f"Import {count} media files?\n\nThis may take a while.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        return reply == QMessageBox.Yes
+
+    def _on_browse_requested(self, kind: str) -> None:
+        """Empty media-panel area was clicked. Open the native OS file
+        picker so the user can select one or many files. Whole folders are
+        imported by dragging them in - the native dialog can't select files
+        and folders together."""
+        kind_filter = {
+            "video": VIDEO_FILTERS,
+            "audio": AUDIO_FILTERS,
+            "image": IMAGE_FILTERS,
+            "sub": SUB_FILTERS,
+        }.get(kind, ALL_MEDIA_FILTER)
+        # Lead with the clicked tab's own type, then every media type.
+        filters = ";;".join([kind_filter, ALL_MEDIA_FILTER, "All files (*)"])
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Add media files", "", filters,
+        )
+        # The visible filter is a convenience, not enforcement: run the
+        # selection through the same expansion/filter gate as a drop.
+        files = self._prepare_import_batch([Path(p) for p in paths if p])
+        if not files:
+            return
+        # No success count afterwards: `_import_paths` skips files it can't
+        # open (and bails out entirely if ffmpeg is missing), so a count of
+        # selected files would claim imports that did not happen. The clip
+        # bin filling in is the feedback, same as a drop.
+        self._import_paths(files, append_to_timeline=False)
 
     def _on_asset_delete_requested(self, asset_id: str) -> None:
         asset = self._assets.get(asset_id)
