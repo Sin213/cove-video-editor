@@ -106,7 +106,7 @@ QMainWindow, QDialog {{
     background-color: {BG_2};
 }}
     QMainWindow {{
-        border: 4px solid {WINDOW_EDGE};
+        border: 1px solid {WINDOW_EDGE};
     }}
 #CovePanel {{
     background: {PANEL};

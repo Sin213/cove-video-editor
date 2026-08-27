@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -35,6 +36,7 @@ from PySide6.QtGui import (
     QPainterPath,
     QPen,
     QPixmap,
+    QRegion,
     QShortcut,
 )
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
@@ -128,6 +130,23 @@ MEDIA_EXTS = VIDEO_EXTS | AUDIO_EXTS | IMAGE_EXTS | SUB_EXTS
 # an ffmpeg probe, so a big folder takes a while. Ask before importing more
 # than this many supported files in one batch.
 FOLDER_IMPORT_WARN_THRESHOLD = 50
+
+# Rounded-corner radius for the frameless window. Windows 11 rounds natively
+# via the DWM; other platforms fall back to a rounded widget mask. Kept
+# modest so the mask never clips titlebar controls or the resize grip.
+WINDOW_CORNER_RADIUS = 10
+# Windows 11 DWM attributes, from dwmapi.h.
+DWMWA_WINDOW_CORNER_PREFERENCE = 33
+DWMWCP_ROUND = 2
+DWMWA_BORDER_COLOR = 34
+
+
+def _colorref_from_hex(color: str) -> int:
+    """`"#rrggbb"` -> a Windows COLORREF, which is `0x00BBGGRR` - the
+    reverse of the byte order the hex string is written in."""
+    h = color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return (b << 16) | (g << 8) | r
 
 
 def _ext_filter(label: str, exts: set[str]) -> str:
@@ -842,6 +861,10 @@ class MainWindow(QMainWindow):
         # pinned to the bottom-right of the window.
         s = self._size_grip.sizeHint()
         self._size_grip.move(self.width() - s.width(), self.height() - s.height())
+        # Keep the rounded-corner mask (non-Windows fallback) in step with
+        # the new size, so no stale region from the old one survives.
+        if getattr(self, "_chrome_applied", False):
+            self._update_corner_mask()
 
     def _toggle_maximize(self) -> None:
         if self.isMaximized():
@@ -853,7 +876,80 @@ class MainWindow(QMainWindow):
         if event.type() == QEvent.WindowStateChange:
             if hasattr(self, "titlebar"):
                 self.titlebar.set_maximized(self.isMaximized())
+            # Square corners while maximized / fullscreen, rounded when
+            # restored.
+            if getattr(self, "_chrome_applied", False):
+                self._update_corner_mask()
         super().changeEvent(event)
+
+    def showEvent(self, event) -> None:  # noqa: ANN001
+        super().showEvent(event)
+        # The native Windows chrome needs a real HWND, so it is applied here
+        # rather than in __init__ where winId() has nothing to hand back.
+        # Once is enough: the DWM keeps the preference for the window's life.
+        if not getattr(self, "_chrome_applied", False):
+            self._chrome_applied = True
+            self._apply_windows_chrome()
+        # Non-Windows platforms round via a widget mask, which must track the
+        # current window size and state.
+        self._update_corner_mask()
+
+    def _dwm_set_window_attribute(self):  # noqa: ANN201
+        """The Windows `DwmSetWindowAttribute` entry point.
+
+        Split out from `_apply_windows_chrome` so the native call can be
+        recorded in tests without a Windows host; `ctypes.windll` only
+        exists on Windows, so this is never reached elsewhere."""
+        import ctypes
+
+        return ctypes.windll.dwmapi.DwmSetWindowAttribute
+
+    def _apply_windows_chrome(self) -> None:
+        """Round the window corners and draw a subtle border using the
+        Windows 11 DWM. No-op on other platforms and on Windows builds
+        without these attributes; the QSS border remains either way."""
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+
+            dwm = self._dwm_set_window_attribute()
+            handle = int(self.winId())
+            if not handle:
+                return
+            hwnd = ctypes.c_void_p(handle)
+            pref = ctypes.c_int(DWMWCP_ROUND)
+            dwm(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
+                ctypes.pointer(pref), ctypes.sizeof(pref))
+            border = ctypes.c_uint(_colorref_from_hex(theme.BORDER_HI))
+            dwm(hwnd, DWMWA_BORDER_COLOR,
+                ctypes.pointer(border), ctypes.sizeof(border))
+        except Exception:  # noqa: BLE001 - cosmetic only; never block startup
+            pass
+
+    def _update_corner_mask(self) -> None:
+        """Rounded-corner fallback for platforms without the Windows DWM.
+
+        Clips the frameless top-level window to a rounded rect via a widget
+        mask, which uniformly rounds the titlebar, body and status bar.
+        Windows rounds natively instead, so this is a no-op there - running
+        both would fight the DWM. The mask is dropped while maximized or
+        fullscreen so the window fills its allocation with square corners
+        like any other app."""
+        if sys.platform == "win32":
+            return
+        if self.isMaximized() or self.isFullScreen():
+            self.clearMask()
+            return
+        r = self.rect()
+        if r.width() <= 0 or r.height() <= 0:
+            return
+        path = QPainterPath()
+        path.addRoundedRect(
+            float(r.x()), float(r.y()), float(r.width()), float(r.height()),
+            WINDOW_CORNER_RADIUS, WINDOW_CORNER_RADIUS,
+        )
+        self.setMask(QRegion(path.toFillPolygon().toPolygon()))
 
     # --- shortcuts -----------------------------------------------------
 
