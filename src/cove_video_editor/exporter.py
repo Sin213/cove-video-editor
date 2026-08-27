@@ -14,6 +14,10 @@ from PySide6.QtCore import QObject, QThread, Signal
 
 from . import ffmpeg_utils as ff
 from .clip import Clip, SubtitleTrack, sequence_length, sort_clips
+# The encoder argument group lives next to the format table because the
+# capability probe builds its command from it too; re-exported here since
+# this is where export command construction lives.
+from .ffmpeg_utils import build_export_video_encoder_args  # noqa: F401
 
 
 if os.name == "nt":
@@ -58,6 +62,10 @@ class ExportJob:
     # SubtitleTrack is applied to the concat'd video output via the
     # `subtitles=` filter before final mapping.
     subtitles: SubtitleTrack | None = None
+    # Which video encoder family to use: "auto" (hardware when it really
+    # works, else CPU), "cpu", "nvenc" or "amf". Callers that predate the
+    # setting - and every audio-only job - keep the safe default.
+    encoder_pref: str = "auto"
 
     @property
     def total_timeline(self) -> float:
@@ -202,13 +210,11 @@ class ExportWorker(QObject):
             ]
 
         if spec["vcodec"]:
-            cmd += ["-c:v", spec["vcodec"]]
-            if spec["vcodec"] == "libx264":
-                cmd += ["-crf", "20", "-preset", "medium"]
-            elif spec["vcodec"] == "libx265":
-                cmd += ["-crf", "24", "-preset", "medium"]
-            if job.fps:
-                cmd += ["-r", str(job.fps)]
+            # Encoder choice is resolved here, outside the filtergraph: the
+            # visual normalization above is identical no matter which
+            # encoder ends up consuming it.
+            encoder = resolve_export_video_encoder(spec, job.encoder_pref)
+            cmd += build_export_video_encoder_args(encoder, fps=job.fps)
         if needs_audio and spec["acodec"]:
             cmd += ["-c:a", spec["acodec"]]
             if spec["acodec"] == "aac":
@@ -674,6 +680,39 @@ def _atempo_chain(speed: float) -> str:
         s /= 2.0
     chain.append(s)
     return ",atempo=".join(f"{v:.4f}" for v in chain)
+
+
+def resolve_export_video_encoder(spec: dict, pref: str) -> str | None:
+    """Map (format spec, user preference) onto one concrete video encoder.
+
+    Audio-only formats have no video encoder at all and never trigger a
+    hardware probe. "cpu" is honoured without probing either. "auto"
+    prefers NVENC, then AMF, then the CPU encoder. An explicit hardware
+    choice that is not genuinely usable on this machine falls back to the
+    CPU encoder for the format - never to the other vendor - so a stale
+    preference carried over from another machine still exports.
+    """
+    cpu_codec = spec["vcodec"]
+    if cpu_codec is None:
+        return None
+    pref = ff.normalize_encoder_pref(pref)
+    if pref == "cpu":
+        return cpu_codec
+    nvenc_codec = spec.get("nvenc_codec")
+    amf_codec = spec.get("amf_codec")
+    if pref == "nvenc":
+        if nvenc_codec and ff.nvenc_available(nvenc_codec):
+            return nvenc_codec
+        return cpu_codec
+    if pref == "amf":
+        if amf_codec and ff.amf_available(amf_codec):
+            return amf_codec
+        return cpu_codec
+    if nvenc_codec and ff.nvenc_available(nvenc_codec):
+        return nvenc_codec
+    if amf_codec and ff.amf_available(amf_codec):
+        return amf_codec
+    return cpu_codec
 
 
 def start_export(job: ExportJob) -> tuple[QThread, ExportWorker]:

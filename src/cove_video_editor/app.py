@@ -7,8 +7,10 @@ from pathlib import Path
 
 from PySide6.QtCore import (
     QEvent,
+    QObject,
     QPoint,
     QRectF,
+    QSettings,
     QSizeF,
     QStandardPaths,
     QThread,
@@ -222,6 +224,103 @@ def export_controls_enabled(
     if audio_only:
         return has_clips or has_added_audio
     return has_clips
+
+
+def visual_export_controls_enabled(
+    has_clips: bool,
+    has_added_audio: bool,
+    audio_only: bool,
+    exporting: bool,
+) -> bool:
+    """Whether the visual-only export controls (Resolution, Encoder) apply.
+
+    They need visual timeline content, a Project export, and no export in
+    flight. Audio Only jobs have no video stream at all, so neither
+    control has any effect there.
+    """
+    if audio_only:
+        return False
+    return export_controls_enabled(
+        has_clips=has_clips,
+        has_added_audio=has_added_audio,
+        audio_only=False,
+        exporting=exporting,
+    )
+
+
+# QSettings identity and key for the video-encoder preference. Only the
+# user's *preference* is persisted; hardware capability is re-probed every
+# launch because drivers/devices change between sessions.
+SETTINGS_ORG = "Cove"
+SETTINGS_APP = "Cove Video Editor"
+ENCODER_SETTINGS_KEY = "export/encoder_pref"
+
+
+def load_encoder_pref() -> str:
+    """Stored encoder preference, normalized. Missing or stale -> "auto"."""
+    stored = QSettings(SETTINGS_ORG, SETTINGS_APP).value(ENCODER_SETTINGS_KEY, None)
+    return ff.normalize_encoder_pref(stored)
+
+
+def save_encoder_pref(pref: str) -> None:
+    QSettings(SETTINGS_ORG, SETTINGS_APP).setValue(
+        ENCODER_SETTINGS_KEY, ff.normalize_encoder_pref(pref)
+    )
+
+
+# How long a closing window waits for an in-flight hardware probe before
+# parking it (see `MainWindow._stop_encoder_probe`).
+ENCODER_PROBE_SHUTDOWN_GRACE_MS = 2000
+
+# Probe threads that outlived their window. Holding the reference here is
+# what stops Qt from destroying a QThread that is still running.
+_ORPHANED_PROBE_THREADS: list[tuple] = []
+
+
+class HardwareProbeWorker(QObject):
+    """Runs the real NVENC/AMF initialization probes off the GUI thread.
+
+    It only emits; every widget update happens on the GUI thread in
+    `MainWindow._apply_encoder_availability` via a queued connection.
+
+    `cancel()` is cooperative: `QThread.quit()` cannot interrupt a
+    blocking subprocess, so the worker checks the flag between probes and
+    stops asking for the ones it has not started yet.
+    """
+
+    # {encoder name: usable here}, one entry per ff.HARDWARE_ENCODERS.
+    probed = Signal(dict)
+    finished = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+        # Ending the child is what makes an in-flight probe return now
+        # instead of at its timeout.
+        ff.abort_hardware_probes()
+
+    def _stop_requested(self) -> bool:
+        return self._cancelled
+
+    def run(self) -> None:
+        caps: dict[str, bool] = {}
+        for encoder in ff.HARDWARE_ENCODERS:
+            # Cancellation is checked between probes; the one already in
+            # flight is ended by `cancel()` killing its child.
+            if self._cancelled:
+                break
+            try:
+                caps[encoder] = ff.hardware_encoder_available(encoder)
+            except Exception:  # noqa: BLE001 - a broken probe is "unavailable"
+                caps[encoder] = False
+        # A cancelled run has nothing trustworthy to report, and the window
+        # it would update is on its way out.
+        if not self._cancelled:
+            self.probed.emit(caps)
+        self.finished.emit()
 
 
 # Two computed timeline positions this close together are the same cut point.
@@ -706,10 +805,24 @@ class MainWindow(QMainWindow):
         self._redo_stack: list[dict] = []
         self._undo_limit: int = 80
 
+        # Hardware encoder probing plumbing. Never touched on the GUI
+        # thread: `_start_encoder_probe` hands the real ffmpeg probes to a
+        # worker and the results come back queued.
+        self._encoder_probe_thread: QThread | None = None
+        self._encoder_probe_worker: HardwareProbeWorker | None = None
+        # Empty until the background probe reports. An encoder missing from
+        # here is *unknown*, not unavailable - see
+        # `_hardware_capability_for_current_format`.
+        self._encoder_caps: dict[str, bool] = {}
+        self._nvenc_available = False
+        self._amf_available = False
+        self._encoder_probe_pending = True
+
         self._build_ui()
         self._install_shortcuts()
         self._update_controls_enabled()
         self._check_ffmpeg()
+        self._start_encoder_probe()
         self.setAcceptDrops(True)
         # Update checker plumbing — populated on demand.
         self._update_thread: QThread | None = None
@@ -1235,6 +1348,13 @@ class MainWindow(QMainWindow):
             self.resolution_combo.addItem(_label, _size)
         self.resolution_combo.setCurrentIndex(0)
 
+        # Video encoder preference. Hardware items start enabled-looking but
+        # the background probe marks whatever this machine cannot actually
+        # initialize as unavailable a moment later.
+        self.encoder_combo = self._build_encoder_combo()
+        # Which hardware encoder is usable depends on the chosen format.
+        self.format_combo.currentTextChanged.connect(self._on_format_changed)
+
         export_lbl = QLabel("EXPORT")
         export_lbl.setObjectName("ExportLabel")
         as_lbl = QLabel("AS")
@@ -1247,6 +1367,10 @@ class MainWindow(QMainWindow):
         res_lbl.setObjectName("ExportLabel")
         bottom.addWidget(res_lbl)
         bottom.addWidget(self.resolution_combo, stretch=0)
+        self.encoder_lbl = QLabel("Encoder")
+        self.encoder_lbl.setObjectName("ExportLabel")
+        bottom.addWidget(self.encoder_lbl)
+        bottom.addWidget(self.encoder_combo, stretch=0)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
@@ -3240,10 +3364,169 @@ class MainWindow(QMainWindow):
         self._populate_format_combo(
             self.export_type_combo.currentText() == "Audio Only"
         )
+        # `_populate_format_combo` repopulates with signals blocked, so the
+        # format-driven refresh has to be re-run here.
+        self._refresh_encoder_availability()
         self._update_controls_enabled()
 
     def _is_audio_only_export(self) -> bool:
         return self.export_type_combo.currentText() == "Audio Only"
+
+    def _on_format_changed(self, _text: str) -> None:
+        self._refresh_encoder_availability()
+
+    # --- video encoder selection ----------------------------------------
+
+    def _build_encoder_combo(self) -> QComboBox:
+        """Encoder preference combo. The internal key lives in the item
+        data so the visible label can be annotated later without breaking
+        lookup or the persisted value."""
+        combo = QComboBox()
+        combo.setMinimumWidth(190)
+        for label, key in zip(ff.ENCODER_OPTIONS, ff.ENCODER_PREFS):
+            combo.addItem(label, key)
+        idx = combo.findData(load_encoder_pref())
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.setToolTip(
+            "Automatic uses an NVIDIA (NVENC) or AMD (AMF) GPU when this "
+            "machine can really encode with one, and the CPU otherwise.\n"
+            "Checking for GPU support…"
+        )
+        combo.currentIndexChanged.connect(self._on_encoder_changed)
+        return combo
+
+    def _selected_encoder_pref(self) -> str:
+        return ff.normalize_encoder_pref(self.encoder_combo.currentData())
+
+    def _on_encoder_changed(self, index: int) -> None:  # noqa: ARG002
+        save_encoder_pref(self._selected_encoder_pref())
+
+    def _apply_encoder_caps(self, caps: dict) -> None:
+        """Store per-encoder probe results, then refresh the combo.
+
+        Results are kept per encoder (not per vendor) because whether
+        hardware is usable depends on the selected format: a build with
+        working `h264_nvenc` but no `hevc_nvenc` can accelerate an H.264
+        export and not an H.265 one.
+        """
+        self._encoder_caps = {str(k): bool(v) for k, v in dict(caps).items()}
+        self._refresh_encoder_availability()
+
+    def _hardware_capability_for_current_format(self, key: str) -> bool | None:
+        """Can `key` ("nvenc"/"amf") encode the selected format?
+
+        Three answers, not two. `None` means *not probed yet*: the encoder
+        this format needs has no result in `_encoder_caps` because the
+        background probe has not reported it. That is not the same as a
+        probe that ran and said no, and treating it as one silently
+        rewrites a persisted hardware preference during a slow startup.
+
+        A format with no video stream or no hardware equivalent is a
+        settled `False` - there is nothing left to learn about it.
+        """
+        spec = ff.EXPORT_FORMATS.get(self.format_combo.currentText())
+        if spec is None or spec.get("vcodec") is None:
+            return False
+        codec = spec.get(f"{key}_codec")
+        if not codec:
+            return False
+        cap = getattr(self, "_encoder_caps", {}).get(codec)
+        return None if cap is None else bool(cap)
+
+    def _hardware_available_for_current_format(self, key: str) -> bool:
+        """Is `key` *confirmed* usable for the selected format?
+
+        Pending counts as not-yet-confirmed, so this stays the right
+        question for "may we claim this hardware is detected?".
+        """
+        return self._hardware_capability_for_current_format(key) is True
+
+    def _refresh_encoder_availability(self) -> None:
+        """Reflect capability + selected format in the combo, GUI thread only.
+
+        Hardware that cannot serve the selected format is disabled and
+        labelled, so it can never be picked into a mysterious export
+        failure or a silent CPU fallback. If it was the current selection
+        (for example a preference carried over from another machine) the
+        UI falls back to Automatic without overwriting the stored
+        preference, so the choice comes back where it can be honoured.
+
+        Only a *probed* negative does any of that. While an encoder's
+        result is still outstanding it is left enabled, unlabelled and
+        selected: a format change during startup probing must not decide
+        the user's preference is unusable before anything has tested it.
+        """
+        combo = getattr(self, "encoder_combo", None)
+        if combo is None:
+            return
+        model = combo.model()
+        reverted = False
+        capability: dict[str, bool | None] = {}
+        for key in ("nvenc", "amf"):
+            cap = self._hardware_capability_for_current_format(key)
+            capability[key] = cap
+            # Pending is treated as usable-for-now: it is not yet a reason
+            # to take anything away from the user.
+            settled_negative = cap is False
+            idx = combo.findData(key)
+            if idx < 0:
+                continue
+            label = ff.ENCODER_OPTIONS[ff.ENCODER_PREFS.index(key)]
+            combo.setItemText(
+                idx, f"{label} - unavailable" if settled_negative else label)
+            item = model.item(idx) if hasattr(model, "item") else None
+            if item is not None:
+                item.setEnabled(not settled_negative)
+            if settled_negative and combo.currentIndex() == idx:
+                reverted = True
+        # These stay strictly "confirmed available" - a pending encoder is
+        # never advertised as detected hardware.
+        self._nvenc_available = capability["nvenc"] is True
+        self._amf_available = capability["amf"] is True
+        self._encoder_probe_pending = any(
+            cap is None for cap in capability.values())
+        if reverted:
+            blocked = combo.blockSignals(True)
+            try:
+                combo.setCurrentIndex(max(0, combo.findData("auto")))
+            finally:
+                combo.blockSignals(blocked)
+        self._refresh_encoder_tooltip()
+
+    _CHECKING_LINE = "Checking for GPU support…"
+
+    def _refresh_encoder_tooltip(self) -> None:
+        detected = []
+        if getattr(self, "_nvenc_available", False):
+            detected.append("NVIDIA (NVENC)")
+        if getattr(self, "_amf_available", False):
+            detected.append("AMD (AMF)")
+        # "Something was found" and "everything has been tested" are
+        # independent: one backend can answer while the other is still
+        # outstanding. A detected result must not present that partial
+        # probe as a finished one, so the checking line survives alongside
+        # it until nothing is left pending.
+        pending = getattr(self, "_encoder_probe_pending", True)
+        if detected:
+            still_checking = f"\n{self._CHECKING_LINE}" if pending else ""
+            self.encoder_combo.setToolTip(
+                "Hardware encoding for this format: " + " and ".join(detected)
+                + "." + still_checking
+                + "\nAutomatic prefers NVENC, then AMF, then the CPU."
+            )
+        elif pending:
+            # Nothing detected *yet* is not the same as nothing to detect.
+            self.encoder_combo.setToolTip(
+                "Automatic uses an NVIDIA (NVENC) or AMD (AMF) GPU when this "
+                "machine can really encode with one, and the CPU otherwise.\n"
+                + self._CHECKING_LINE
+            )
+        else:
+            self.encoder_combo.setToolTip(
+                "No usable NVIDIA NVENC or AMD AMF encoder for the selected "
+                "format on this machine.\n"
+                "Automatic and CPU both encode on the processor."
+            )
 
     def _on_export_clicked(self) -> None:
         fmt_key = self.format_combo.currentText()
@@ -3301,6 +3584,7 @@ class MainWindow(QMainWindow):
             region_start=region_start,
             region_end=region_end,
             subtitles=active_sub,
+            encoder_pref=self._selected_encoder_pref(),
         )
 
         self._last_progress = 0
@@ -3406,17 +3690,17 @@ class MainWindow(QMainWindow):
             audio_only=audio_only,
             exporting=exporting,
         )
-        # Resolution only applies to visual output: it needs visual timeline
-        # content, a Project export, and no export in flight.
-        self.resolution_combo.setEnabled(
-            not audio_only
-            and export_controls_enabled(
-                has_clips=loaded,
-                has_added_audio=bool(self._added_audios),
-                audio_only=False,
-                exporting=exporting,
-            )
+        # Resolution and Encoder only apply to visual output: they need
+        # visual timeline content, a Project export, and no export in flight.
+        visual_enabled = visual_export_controls_enabled(
+            has_clips=loaded,
+            has_added_audio=bool(self._added_audios),
+            audio_only=audio_only,
+            exporting=exporting,
         )
+        self.resolution_combo.setEnabled(visual_enabled)
+        self.encoder_combo.setEnabled(visual_enabled)
+        self.encoder_lbl.setEnabled(visual_enabled)
         self.crop_btn.setEnabled(loaded)
         self.format_combo.setEnabled(can_export)
         self.export_btn.setEnabled(can_export)
@@ -3473,7 +3757,57 @@ class MainWindow(QMainWindow):
                     thread.quit(); thread.wait(1500)
         if self._export_thread and self._export_thread.isRunning():
             self._export_thread.quit(); self._export_thread.wait(2000)
+        self._stop_encoder_probe()
         super().closeEvent(event)
+
+    # --- background hardware encoder probe -------------------------------
+
+    def _start_encoder_probe(self) -> None:
+        """Kick off the real NVENC/AMF initialization probes off-thread.
+
+        Starting the thread is cheap, so the UI is interactive immediately;
+        the combo just shows every option until the results arrive.
+        """
+        if self._encoder_probe_thread is not None:
+            return
+        # A previous window may have aborted probing on its way out; this
+        # is a new session, so re-arm before asking anything.
+        ff.clear_hardware_probe_abort()
+        thread = QThread()
+        worker = HardwareProbeWorker()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.probed.connect(self._apply_encoder_caps, Qt.QueuedConnection)
+        worker.finished.connect(thread.quit, Qt.QueuedConnection)
+        thread.finished.connect(self._on_encoder_probe_done, Qt.QueuedConnection)
+        self._encoder_probe_thread = thread
+        self._encoder_probe_worker = worker
+        thread.start()
+
+    def _on_encoder_probe_done(self) -> None:
+        self._encoder_probe_thread = None
+        self._encoder_probe_worker = None
+
+    def _stop_encoder_probe(self) -> None:
+        """Shut a still-running probe down before the window goes away.
+
+        `worker.cancel()` kills the probe child, so the worker returns
+        almost immediately and the thread joins inside the grace period.
+        The parking list is only a last-resort safety net for the case
+        where it somehow does not: destroying a running QThread aborts the
+        process, so holding the reference is strictly the safer outcome.
+        """
+        thread = getattr(self, "_encoder_probe_thread", None)
+        worker = getattr(self, "_encoder_probe_worker", None)
+        if thread is None or not thread.isRunning():
+            return
+        if worker is not None:
+            worker.cancel()
+        thread.quit()
+        if not thread.wait(ENCODER_PROBE_SHUTDOWN_GRACE_MS):
+            _ORPHANED_PROBE_THREADS.append((thread, worker))
+        self._encoder_probe_thread = None
+        self._encoder_probe_worker = None
 
     def _check_ffmpeg(self) -> None:
         try:
