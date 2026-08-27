@@ -244,11 +244,19 @@ class CropDormancyGuardTests(unittest.TestCase):
             self.assertNotIn(".crop_rect", src, module)
             self.assertNotIn(".crop_preset", src, module)
 
-    def test_g3_exporter_does_not_read_committed_crop_state(self) -> None:
-        for module in ("exporter.py", "ffmpeg_utils.py"):
-            src = self._source(module)
-            self.assertNotIn(".crop_rect", src, module)
-            self.assertNotIn(".crop_preset", src, module)
+    def test_g3_ffmpeg_utils_does_not_read_committed_crop_state(self) -> None:
+        """Tab 2I-B deliberately taught ``exporter.py`` to read
+        ``crop_rect``, so it is no longer covered here. ``ffmpeg_utils.py``
+        stays crop-unaware: it owns encoder/format concerns, and crop is a
+        filtergraph concern that belongs to the exporter.
+
+        ``crop_preset`` remains editor-only metadata that no export path
+        may consult - geometry comes from ``crop_rect`` alone, so a Free
+        custom crop exports exactly like a preset crop."""
+        src = self._source("ffmpeg_utils.py")
+        self.assertNotIn(".crop_rect", src)
+        self.assertNotIn(".crop_preset", src)
+        self.assertNotIn(".crop_preset", self._source("exporter.py"))
 
     def test_g4_rejected_canvas_fit_architecture_is_absent(self) -> None:
         self.assertFalse(hasattr(_clip(), "crop_fit_mode"))

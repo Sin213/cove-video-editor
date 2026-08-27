@@ -236,6 +236,11 @@ class ExportWorker(QObject):
         parts: list[str] = []
         v_labels: list[str] = []
         a_labels: list[str] = []
+        # Resolved once for the whole export, matching resolve_target_size:
+        # either committed per-clip crops are authoritative, or the legacy
+        # global crop is. Never both, so a stale global crop can't leak onto
+        # clips the user left uncropped.
+        per_clip_crop = has_per_clip_crop(job.clips)
         # libmp3lame works best with 44100 Hz fltp; force that in silence sources.
         if acodec == "libmp3lame":
             _null_sr = 44100
@@ -254,40 +259,35 @@ class ExportWorker(QObject):
                 if not is_audio_only:
                     if is_image:
                         # Image input is already the right length (`-t`),
-                        # so trim/setpts is unnecessary — just normalize
+                        # so trim/setpts is unnecessary - just normalize
                         # pts to 0 and run through crop/scale/pad.
                         vchain = ["setpts=PTS-STARTPTS"]
-                        if job.crop:
-                            x, y, w, h = job.crop
-                            vchain.append(f"crop={w}:{h}:{x}:{y}")
-                        vchain.append(
-                            f"scale={tgt_w}:{tgt_h}:force_original_aspect_ratio=decrease"
-                            ":force_divisible_by=2,"
-                            f"pad={tgt_w}:{tgt_h}:(ow-iw)/2:(oh-ih)/2:color=black,"
-                            "setsar=1"
-                        )
-                        # yuv420p normalizes the pixel format so concat with
-                        # neighbouring video clips doesn't fail when the
-                        # source image is RGBA/RGB24.
-                        vchain.append("format=yuv420p")
                     else:
                         vchain = [f"trim=start={c.src_start:.3f}:end={c.src_end:.3f}",
                                   "setpts=PTS-STARTPTS"]
-                        if job.crop:
-                            x, y, w, h = job.crop
-                            vchain.append(f"crop={w}:{h}:{x}:{y}")
-                        vchain.append(
-                            f"scale={tgt_w}:{tgt_h}:force_original_aspect_ratio=decrease"
-                            ":force_divisible_by=2,"
-                            f"pad={tgt_w}:{tgt_h}:(ow-iw)/2:(oh-ih)/2:color=black,"
-                            "setsar=1"
-                        )
-                        if abs(c.speed - 1.0) > 1e-6:
-                            vchain.append(f"setpts={1.0/c.speed:.5f}*PTS")
-                        # Mixed-resolution sources can reach concat with matching
-                        # dimensions but different SAR/pix_fmt; setsar=1 above and
-                        # yuv420p here keep every visual branch identical.
-                        vchain.append("format=yuv420p")
+                    # Crop describes *source* framing, so it runs before the
+                    # canvas normalization below - never on the already
+                    # scaled/padded frame. Image and video share this one
+                    # resolver so the two branches cannot drift apart.
+                    seg_crop = (
+                        effective_clip_crop_pixels(c) if per_clip_crop else job.crop
+                    )
+                    if seg_crop:
+                        x, y, w, h = seg_crop
+                        vchain.append(f"crop={w}:{h}:{x}:{y}")
+                    vchain.append(
+                        f"scale={tgt_w}:{tgt_h}:force_original_aspect_ratio=decrease"
+                        ":force_divisible_by=2,"
+                        f"pad={tgt_w}:{tgt_h}:(ow-iw)/2:(oh-ih)/2:color=black,"
+                        "setsar=1"
+                    )
+                    if not is_image and abs(c.speed - 1.0) > 1e-6:
+                        vchain.append(f"setpts={1.0/c.speed:.5f}*PTS")
+                    # Mixed-resolution sources can reach concat with matching
+                    # dimensions but different SAR/pix_fmt; setsar=1 above and
+                    # yuv420p here keep every visual branch identical. For
+                    # images it also normalizes RGBA/RGB24 sources.
+                    vchain.append("format=yuv420p")
                     parts.append(f"[{inp}:v]" + ",".join(vchain) + f"[v{i}]")
                     v_labels.append(f"v{i}")
                 if needs_audio:
@@ -506,17 +506,97 @@ class ExportWorker(QObject):
         self.eta.emit(self._eta_smoothed)
 
 
+#: A committed crop covering the whole source frame. The UI canonicalizes
+#: "no crop" to ``None``, but the domain deliberately allows this tuple to
+#: be stored, so the exporter has to treat it as "no effective crop".
+_FULL_FRAME_CROP = (0.0, 0.0, 1.0, 1.0)
+
+
+def effective_clip_crop_pixels(clip: Clip) -> tuple[int, int, int, int] | None:
+    """Convert one clip's committed normalized ``crop_rect`` into an even,
+    in-bounds pixel crop ``(x, y, w, h)``, or ``None`` when the clip has no
+    effective crop.
+
+    This is the single normalized-to-pixel conversion for the exporter -
+    both the video and the image branch call it, so the two can never
+    diverge. The rounding and even-snapping mirror ``MainWindow._crop_pixels``
+    so a rectangle committed in the UI exports as the same pixels the crop
+    overlay showed.
+
+    ``crop_preset`` is editor metadata and is deliberately not consulted: a
+    Free custom crop exports exactly like a preset crop. Source dimensions
+    come from the already-probed ``clip.asset``; this helper never probes.
+    """
+    rect = clip.crop_rect
+    if rect is None or tuple(rect) == _FULL_FRAME_CROP:
+        return None
+    sw, sh = clip.asset.width, clip.asset.height
+    if sw <= 0 or sh <= 0:
+        return None
+    nx, ny, nw, nh = rect
+    x = int(round(nx * sw)); y = int(round(ny * sh))
+    w = int(round(nw * sw)); h = int(round(nh * sh))
+    w -= w % 2; h -= h % 2
+    x = max(0, min(sw - w, x - x % 2))
+    y = max(0, min(sh - h, y - y % 2))
+    if w < 2 or h < 2:
+        return None
+    # A rectangle that resolves to the whole frame is not an effective
+    # crop, even when the normalized tuple was not exactly (0, 0, 1, 1) -
+    # float noise from the overlay's aspect math lands here routinely.
+    # Emitting crop=<full frame> would be a no-op filter, and worse, it
+    # would flip the export into per-clip mode and discard the legacy
+    # global crop for no reason. `sw - sw % 2` is the widest even crop an
+    # odd-width source can yield, so it counts as full coverage too.
+    if x == 0 and y == 0 and w >= sw - sw % 2 and h >= sh - sh % 2:
+        return None
+    return (x, y, w, h)
+
+
+def has_per_clip_crop(clips: list[Clip]) -> bool:
+    """True when committed per-clip crop state is authoritative for this
+    export, i.e. at least one clip carries an effective (non-full-frame)
+    crop. Resolved once per export: in per-clip mode the legacy global
+    ``ExportJob.crop`` is ignored entirely, so an old selection-scoped crop
+    cannot leak onto clips the user never cropped."""
+    return any(effective_clip_crop_pixels(c) is not None for c in clips)
+
+
 def resolve_target_size(
     clips: list[Clip],
     crop: tuple[int, int, int, int] | None,
     width: int | None,
     height: int | None,
 ) -> tuple[int, int]:
-    """Output size policy: honor crop, else an explicit width+height pair,
-    else the first real (non-gap) visual clip, else 1280x720. Final
-    dimensions are forced even so encoders accept them."""
+    """Output size policy, in two modes, with the final dimensions forced
+    even so encoders accept them.
+
+    Legacy mode (no clip carries an effective ``crop_rect``): honor the
+    global ``crop``, else an explicit width+height pair, else the first
+    real (non-gap) visual clip, else 1280x720.
+
+    Per-clip mode (at least one effective ``crop_rect``): an explicit
+    width+height pair wins over every crop, because a mixed-crop timeline
+    has no single crop that could define the canvas. Without one, the
+    canvas is the *first visual clip's* effective geometry - its crop size
+    if it has a crop, else its native size. Timeline order is authoritative
+    (``_build_command`` passes timeline-sorted clips); the selected clip,
+    the last crop, and the largest crop deliberately have no say, so the
+    same project always exports at the same size.
+    """
     first_real = next((c for c in clips if c.asset.width > 0), None)
-    if crop:
+    if has_per_clip_crop(clips):
+        if width and height:
+            tgt_w, tgt_h = width, height
+        elif first_real is not None:
+            first_crop = effective_clip_crop_pixels(first_real)
+            if first_crop is not None:
+                tgt_w, tgt_h = first_crop[2], first_crop[3]
+            else:
+                tgt_w, tgt_h = first_real.asset.width, first_real.asset.height
+        else:
+            tgt_w, tgt_h = 1280, 720
+    elif crop:
         _, _, tgt_w, tgt_h = crop
     elif width and height:
         tgt_w, tgt_h = width, height
