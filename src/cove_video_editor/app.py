@@ -102,7 +102,7 @@ from .clip import (
     split_clip,
 )
 from .clip_bin import ASSET_MIME, ClipBin
-from .crop_overlay import CropOverlay
+from .crop_overlay import CROP_ASPECT_PRESETS, CropOverlay
 from .downloader import DownloadVideoDialog
 from .exporter import AudioTrack, ExportJob, start_export
 from .thumbnails import start_thumbnails, start_waveform
@@ -1219,6 +1219,16 @@ class MainWindow(QMainWindow):
         self.crop_btn = QPushButton("Crop")
         self.crop_btn.setCheckable(True)
         self.crop_btn.toggled.connect(self._on_crop_toggled)
+        self.crop_aspect_combo = QComboBox()
+        self.crop_aspect_combo.setToolTip("Crop aspect ratio preset")
+        self.crop_aspect_combo.addItems(list(CROP_ASPECT_PRESETS.keys()))
+        self.crop_aspect_combo.setCurrentText("Free (Custom)")
+        self.crop_aspect_combo.setVisible(False)
+        self.crop_aspect_combo.currentTextChanged.connect(self._on_crop_aspect_changed)
+        self.crop_fit_btn = QPushButton("Fit to canvas")
+        self.crop_fit_btn.setToolTip("Fit and center crop box to the full canvas bounds")
+        self.crop_fit_btn.setVisible(False)
+        self.crop_fit_btn.clicked.connect(self._on_crop_fit_clicked)
         self.crop_reset_btn = QPushButton("Reset crop")
         self.crop_reset_btn.setVisible(False)
         self.crop_reset_btn.clicked.connect(self._on_crop_reset)
@@ -1231,6 +1241,8 @@ class MainWindow(QMainWindow):
         transport.addWidget(self.download_video_btn)
         transport.addSpacing(4)
         transport.addWidget(self.crop_btn)
+        transport.addWidget(self.crop_aspect_combo)
+        transport.addWidget(self.crop_fit_btn)
         transport.addWidget(self.crop_reset_btn)
         transport.addStretch(1)
         transport.addWidget(self.range_label)
@@ -3018,12 +3030,40 @@ class MainWindow(QMainWindow):
         if checked and c:
             self.crop_overlay.set_video_aspect(c.asset.width / max(1, c.asset.height))
             if self.crop_overlay.normalized_rect() == QRectF(0, 0, 1, 1):
-                self.crop_overlay.set_normalized_rect(QRectF(0.1, 0.1, 0.8, 0.8))
+                preset_name = self.crop_aspect_combo.currentText()
+                ratio = CROP_ASPECT_PRESETS.get(preset_name)
+                if ratio is not None:
+                    self.crop_overlay.set_aspect_ratio_preset(ratio, preset_name)
+                else:
+                    self.crop_overlay.set_normalized_rect(QRectF(0.1, 0.1, 0.8, 0.8))
         self.crop_overlay.setVisible(checked)
         self.crop_overlay.raise_()
+        self.crop_aspect_combo.setVisible(checked)
+        self.crop_fit_btn.setVisible(checked)
         self.crop_reset_btn.setVisible(checked)
 
+    def _sync_crop_overlay_aspect(self) -> None:
+        """Point the overlay at the selected clip's source aspect, if any."""
+        c = self._selected_clip()
+        if c is not None:
+            self.crop_overlay.set_video_aspect(c.asset.width / max(1, c.asset.height))
+
+    def _on_crop_aspect_changed(self, preset_name: str) -> None:
+        self._sync_crop_overlay_aspect()
+        self.crop_overlay.set_aspect_ratio_preset(
+            CROP_ASPECT_PRESETS.get(preset_name), preset_name,
+        )
+
+    def _on_crop_fit_clicked(self) -> None:
+        self._sync_crop_overlay_aspect()
+        self.crop_overlay.fit_to_canvas()
+
     def _on_crop_reset(self) -> None:
+        # Mechanically restoring the selector must not re-apply geometry;
+        # the overlay reset below is what defines the post-reset state.
+        self.crop_aspect_combo.blockSignals(True)
+        self.crop_aspect_combo.setCurrentText("Free (Custom)")
+        self.crop_aspect_combo.blockSignals(False)
         self.crop_overlay.reset()
 
     # --- preview context menu ----------------------------------------

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
 
@@ -9,12 +9,30 @@ HANDLE_SIZE = 10
 HIT_PAD = 14
 MIN_NORMALIZED = 0.05
 
+FREE_PRESET = "Free (Custom)"
+
+#: Selectable crop aspect ratios, mapped to a target *pixel* aspect ratio.
+#: ``None`` means no lock - handles resize freely.
+CROP_ASPECT_PRESETS: dict[str, float | None] = {
+    FREE_PRESET: None,
+    "16:9 (Landscape / YouTube)": 16 / 9,
+    "9:16 (TikTok / Reels / Shorts)": 9 / 16,
+    "1:1 (Square / Instagram)": 1.0,
+    "4:5 (Portrait / Social)": 4 / 5,
+    "4:3 (Standard / Classic)": 4 / 3,
+    "21:9 (Cinematic / Ultrawide)": 21 / 9,
+}
+
 
 class CropOverlay(QWidget):
     """Draggable crop rectangle in normalized 0..1 source coords.
 
     Renders on top of a video widget, accounts for letterboxing so the rect
     always tracks the actual video pixels rather than the widget area.
+
+    The rect can be locked to a standard aspect ratio preset. Because the
+    rect is normalized against the source, a target *pixel* aspect maps to
+    a normalized ratio of ``target_aspect / source_aspect``.
     """
 
     cropChanged = Signal(QRectF)
@@ -23,6 +41,8 @@ class CropOverlay(QWidget):
         super().__init__(parent)
         self.setMouseTracking(True)
         self._video_aspect: float = 16 / 9
+        self._aspect_lock: float | None = None
+        self._preset_name: str = FREE_PRESET
         self._rect_norm: QRectF = QRectF(0.0, 0.0, 1.0, 1.0)
         self._drag_target: str | None = None
         self._drag_start_widget: QPointF | None = None
@@ -30,8 +50,65 @@ class CropOverlay(QWidget):
 
     def set_video_aspect(self, aspect: float) -> None:
         if aspect > 0:
+            changed = abs(aspect - self._video_aspect) > 1e-9
             self._video_aspect = aspect
+            if changed and self._aspect_lock is not None:
+                # The normalized ratio depends on the source, so an active
+                # lock has to be re-fitted or its effective pixel aspect
+                # silently drifts to the wrong ratio. Only a genuine change
+                # justifies it: callers re-announce the same aspect purely
+                # to synchronise, and refitting there would throw away a
+                # crop the user had already moved or resized.
+                self._apply_max_area_rect()
             self.update()
+
+    def set_aspect_ratio_preset(
+        self, aspect_target: float | None, preset_name: str = "",
+    ) -> None:
+        """Lock the crop box to ``aspect_target`` (a pixel aspect), or unlock.
+
+        Locking immediately fits a centered maximum-area rectangle at that
+        ratio. Passing ``None`` clears the lock and leaves the current
+        rectangle alone - clearing the lock is not a reset.
+        """
+        self._aspect_lock = aspect_target
+        self._preset_name = preset_name or (
+            FREE_PRESET if aspect_target is None else f"{aspect_target:.2f}"
+        )
+        if aspect_target is not None and self._video_aspect > 0:
+            self._apply_max_area_rect()
+        self.update()
+
+    def aspect_ratio_preset(self) -> float | None:
+        return self._aspect_lock
+
+    def aspect_badge_text(self) -> str | None:
+        """Compact ratio tag for the on-canvas pill, or ``None`` when free."""
+        if self._aspect_lock is None or self._preset_name == FREE_PRESET:
+            return None
+        return self._preset_name.split(" ")[0]
+
+    def _max_area_rect(self, aspect_target: float) -> QRectF:
+        """Largest centered rect at ``aspect_target`` inside the 0..1 source.
+
+        Deliberately not floored at ``MIN_NORMALIZED``: on an extreme source
+        (a very wide or very tall one) the largest rect at the requested
+        ratio can be thinner than the minimum, and raising it would hand
+        back a different aspect than the one the user picked.
+        """
+        norm_ar = aspect_target / self._video_aspect
+        if norm_ar <= 1.0:
+            h = 1.0
+            w = norm_ar
+        else:
+            w = 1.0
+            h = 1.0 / norm_ar
+        return QRectF((1.0 - w) / 2.0, (1.0 - h) / 2.0, w, h)
+
+    def _apply_max_area_rect(self) -> None:
+        self._rect_norm = self._max_area_rect(self._aspect_lock)
+        self.update()
+        self.cropChanged.emit(self.normalized_rect())
 
     def set_normalized_rect(self, rect: QRectF) -> None:
         self._rect_norm = self._clamp(QRectF(rect))
@@ -41,6 +118,21 @@ class CropOverlay(QWidget):
         return QRectF(self._rect_norm)
 
     def reset(self) -> None:
+        self._aspect_lock = None
+        self._preset_name = FREE_PRESET
+        self._rect_norm = QRectF(0.0, 0.0, 1.0, 1.0)
+        self.update()
+        self.cropChanged.emit(self.normalized_rect())
+
+    def fit_to_canvas(self) -> None:
+        """Grow the crop box to the largest rect that still fits the source.
+
+        With a preset locked this keeps the ratio and re-centres; in Free
+        mode it means the whole frame. The mode itself is never changed.
+        """
+        if self._aspect_lock is not None and self._video_aspect > 0:
+            self._apply_max_area_rect()
+            return
         self._rect_norm = QRectF(0.0, 0.0, 1.0, 1.0)
         self.update()
         self.cropChanged.emit(self.normalized_rect())
@@ -123,6 +215,19 @@ class CropOverlay(QWidget):
         for pt in self._handle_centers(c).values():
             p.drawRect(QRectF(pt.x() - s / 2, pt.y() - s / 2, s, s))
 
+        tag = self.aspect_badge_text()
+        if tag:
+            badge_font = QFont(p.font())
+            badge_font.setBold(True)
+            p.setFont(badge_font)
+            tw = p.fontMetrics().horizontalAdvance(tag)
+            badge = QRectF(c.left() + 8, c.top() + 8, tw + 14, 20)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(13, 18, 22, 210))
+            p.drawRoundedRect(badge, 4, 4)
+            p.setPen(QColor("#5fb4ff"))
+            p.drawText(badge, Qt.AlignCenter, tag)
+
         p.end()
 
     def _hit_test(self, pos: QPointF) -> str | None:
@@ -167,6 +272,8 @@ class CropOverlay(QWidget):
 
         if target == "move":
             r.translate(dx, dy)
+        elif self._aspect_lock is not None and self._video_aspect > 0:
+            r = self._locked_drag_rect(target, r, dx, dy)
         else:
             if "l" in target:
                 r.setLeft(min(r.right() - MIN_NORMALIZED, r.left() + dx))
@@ -177,8 +284,93 @@ class CropOverlay(QWidget):
             if "b" in target:
                 r.setBottom(max(r.top() + MIN_NORMALIZED, r.bottom() + dy))
 
-        self._rect_norm = self._clamp(r)
+        if self._aspect_lock is not None and self._video_aspect > 0:
+            # The generic clamp raises a sub-minimum axis, which would
+            # rewrite the locked ratio; the locked rect is built in-bounds,
+            # so it only ever needs repositioning.
+            self._rect_norm = self._clamp_bounds(r)
+        else:
+            self._rect_norm = self._clamp(r)
         self.update()
+
+    def _clamp_bounds(self, r: QRectF) -> QRectF:
+        """Slide ``r`` back inside 0..1 without touching its size."""
+        return QRectF(
+            min(max(0.0, r.left()), max(0.0, 1.0 - r.width())),
+            min(max(0.0, r.top()), max(0.0, 1.0 - r.height())),
+            r.width(), r.height(),
+        )
+
+    def _locked_drag_rect(
+        self, target: str, orig: QRectF, dx: float, dy: float,
+    ) -> QRectF:
+        """Resize ``orig`` by a drag delta while holding the locked ratio.
+
+        Corners anchor the opposite corner; edges anchor the opposite edge
+        and keep the orthogonal centre put where the bounds allow it.
+        """
+        norm_ar = self._aspect_lock / self._video_aspect
+        # Both normalized axes must stay at or above MIN_NORMALIZED, so the
+        # floor lives on whichever axis hits it first. Deriving the other
+        # from the ratio keeps a fully shrunk box on-ratio. On an extreme
+        # source that floor can exceed what actually fits, and holding the
+        # ratio wins over holding the minimum - otherwise the box leaves
+        # the frame and gets reshaped by the clamp.
+        min_w = min(
+            max(MIN_NORMALIZED, MIN_NORMALIZED * norm_ar),
+            min(1.0, norm_ar),
+        )
+        min_h = min_w / norm_ar
+
+        if target in ("tl", "tr", "bl", "br"):
+            grows_right = "r" in target
+            grows_down = "b" in target
+            # Follow whichever pointer axis moved further, in width terms.
+            grow_x = dx if grows_right else -dx
+            grow_y = dy if grows_down else -dy
+            delta_w = (
+                grow_x if abs(grow_x) >= abs(grow_y * norm_ar) else grow_y * norm_ar
+            )
+            max_w = min(
+                (1.0 - orig.left()) if grows_right else orig.right(),
+                ((1.0 - orig.top()) if grows_down else orig.bottom()) * norm_ar,
+            )
+            w = max(min_w, min(max_w, orig.width() + delta_w))
+            h = w / norm_ar
+            x = orig.left() if grows_right else orig.right() - w
+            y = orig.top() if grows_down else orig.bottom() - h
+            return QRectF(x, y, w, h)
+
+        if target in ("l", "r"):
+            grows_right = target == "r"
+            # h = w / norm_ar must stay <= 1, hence the norm_ar width cap.
+            max_w = min(
+                (1.0 - orig.left()) if grows_right else orig.right(), norm_ar,
+            )
+            w = max(min_w, min(max_w, orig.width() + (dx if grows_right else -dx)))
+            h = w / norm_ar
+            cy = (orig.top() + orig.bottom()) / 2.0
+            return QRectF(
+                orig.left() if grows_right else orig.right() - w,
+                max(0.0, min(1.0 - h, cy - h / 2.0)),
+                w, h,
+            )
+
+        if target in ("t", "b"):
+            grows_down = target == "b"
+            max_h = min(
+                (1.0 - orig.top()) if grows_down else orig.bottom(), 1.0 / norm_ar,
+            )
+            h = max(min_h, min(max_h, orig.height() + (dy if grows_down else -dy)))
+            w = h * norm_ar
+            cx = (orig.left() + orig.right()) / 2.0
+            return QRectF(
+                max(0.0, min(1.0 - w, cx - w / 2.0)),
+                orig.top() if grows_down else orig.bottom() - h,
+                w, h,
+            )
+
+        return QRectF(orig)
 
     def _clamp(self, r: QRectF) -> QRectF:
         if r.width() < MIN_NORMALIZED:
