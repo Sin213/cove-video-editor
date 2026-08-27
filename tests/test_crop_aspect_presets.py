@@ -874,7 +874,10 @@ class TestNoCanvasFitModeFeature(unittest.TestCase):
             fps=30.0, has_audio=False,
         )
         c = Clip(asset=asset, timeline_start=0.0, src_start=0.0, src_end=1.0)
-        for attr in ("crop_rect", "crop_preset", "crop_fit_mode"):
+        # Tab 2I-A gives Clip committed `crop_rect` / `crop_preset` fields, so
+        # this guard now covers only the rejected canvas-fit concept. The
+        # committed-crop contract itself lives in tests/test_crop_clip_state.py.
+        for attr in ("crop_fit_mode", "canvas_fit", "canvas_aspect"):
             with self.subTest(attr=attr):
                 self.assertFalse(hasattr(c, attr))
 

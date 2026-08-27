@@ -234,6 +234,19 @@ class Clip:
     thumb_pixmaps: list[QPixmap] = field(default_factory=list)
     waveform_peaks: list[float] = field(default_factory=list)
     waveform_rate: int = 0
+    # Committed crop, in normalized source coordinates: (x, y, w, h) with
+    # 0 <= x, y and 0 < w, h <= 1 and x + w <= 1, y + h <= 1. `None` is the
+    # canonical "no crop" state - a full-frame (0, 0, 1, 1) tuple would make
+    # every ordinary clip look cropped. Deliberately a plain tuple, not a
+    # QRectF, so the model stays usable without GUI objects and clones,
+    # compares and snapshots as plain data. `crop_preset` is the opaque
+    # display key from the crop overlay's preset registry, kept only so the
+    # UI can restore its label later; the rect alone is export geometry.
+    # Appended last so no pre-existing positional argument slot shifts.
+    # Both fields are dormant in this slice: no UI or exporter code reads
+    # them yet.
+    crop_rect: tuple[float, float, float, float] | None = None
+    crop_preset: str = "Free (Custom)"
 
     def __post_init__(self) -> None:
         if self.src_end <= 0:
@@ -262,6 +275,7 @@ class Clip:
             muted=self.muted, audio_volume=self.audio_volume,
             linked_audio=self.linked_audio,
             audio_offset=self.audio_offset, audio_removed=self.audio_removed,
+            crop_rect=self.crop_rect, crop_preset=self.crop_preset,
         )
         c.thumbs = list(self.thumbs)
         c.thumb_pixmaps = list(self.thumb_pixmaps)
