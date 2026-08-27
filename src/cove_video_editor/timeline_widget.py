@@ -105,6 +105,30 @@ def edge_scroll_delta(rel_x: int, viewport_width: int) -> int:
     return direction * int(round(speed))
 
 
+# ---- added-audio volume / mute badge ---------------------------------------
+# A tile only earns a badge when its audio state is *not* the default, so an
+# untouched timeline stays clean. Volumes within VOLUME_BADGE_EPS of 100% are
+# treated as default: the volume dialog works in whole percent, and rounding
+# noise must not produce a permanent "100%" sticker.
+VOLUME_BADGE_EPS = 0.01
+BADGE_H = 14
+BADGE_PAD_X = 8
+BADGE_MARGIN = 4
+BADGE_BG_ALPHA = 210
+
+
+def added_audio_volume_badge(audio: AddedAudio) -> str | None:
+    """The badge text for one added-audio item, or None when it is at its
+    default state. An explicit mute wins over the stored volume, which is
+    what keeps `volume == 0.0` (``"0%"``) readable as a distinct state from
+    an actual mute (``"Muted"``)."""
+    if audio.muted:
+        return "Muted"
+    if abs(audio.volume - 1.0) > VOLUME_BADGE_EPS:
+        return f"{int(round(audio.volume * 100))}%"
+    return None
+
+
 @dataclass
 class _Drag:
     mode: str = ""                    # "seek", "select", "move_clip", "trim_l", "trim_r", "move_audio", "resize_tracks", "trim_added_l", "trim_added_r"
@@ -137,6 +161,7 @@ class TimelineWidget(QWidget):
     addedAudioDeleteRequested = Signal(str)               # audio id ("" → clear all)
     addedAudioRangeChanged = Signal(str)                  # audio id — src_start/src_end edited
     addedAudioVolumeRequested = Signal(str)               # audio id — edit per-item volume
+    addedAudioMuteRequested = Signal(str)                 # audio id - toggle per-item mute
     clipDoubleClicked = Signal(str)               # clip id
     audioLinkToggled = Signal(str)                # clip id
     clipDeleteRequested = Signal(str)             # clip id
@@ -758,6 +783,7 @@ class TimelineWidget(QWidget):
                     tile, tile_vis, audio.src_span, theme.C_WARN,
                     src_start=audio.src_start,
                 )
+            self._draw_added_audio_badge(p, audio, tile_vis)
             selected = audio.id == self._added_audio_selected_id
             if selected:
                 pen = QPen(theme.C_WARN)
@@ -776,6 +802,39 @@ class TimelineWidget(QWidget):
                 p.setPen(pen)
                 p.setBrush(Qt.NoBrush)
                 p.drawRect(tile_vis.adjusted(0, 0, -1, -1))
+
+    def _draw_added_audio_badge(
+        self, p: QPainter, audio: AddedAudio, tile_vis: QRect,
+    ) -> None:
+        """Stamp the volume / mute state into the tile's upper-right corner.
+
+        Purely decorative: the badge is laid out from `tile_vis`, never fed
+        back into it, so tile geometry, hit testing and selection rects are
+        untouched. A tile too narrow to hold the badge is left bare rather
+        than having it overflow into the neighbouring one."""
+        text = added_audio_volume_badge(audio)
+        if text is None:
+            return
+        p.save()
+        f = p.font(); f.setBold(True); p.setFont(f)
+        bw = p.fontMetrics().horizontalAdvance(text) + BADGE_PAD_X
+        bh = BADGE_H
+        if tile_vis.width() < bw + 2 * BADGE_MARGIN or tile_vis.height() < bh + 2:
+            p.restore()
+            return
+        rect = QRect(
+            tile_vis.right() - bw - BADGE_MARGIN, tile_vis.top() + BADGE_MARGIN,
+            bw, bh,
+        )
+        bg = QColor(theme.C_BG)
+        bg.setAlpha(BADGE_BG_ALPHA)
+        p.setPen(Qt.NoPen)
+        p.setBrush(bg)
+        p.drawRoundedRect(rect, 3, 3)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(theme.C_DANGER if audio.muted else theme.C_WARN)
+        p.drawText(rect, Qt.AlignCenter, text)
+        p.restore()
 
     def _draw_clip_waveform(
         self, p: QPainter, c: Clip, r: QRect, r_vis: QRect, color: QColor,
@@ -1647,6 +1706,7 @@ class TimelineWidget(QWidget):
         remove_lane_action = None
         clip_volume_action = None
         audio_volume_action = None
+        audio_mute_action = None
         move_start_action = None
         move_playhead_action = None
         close_gap_action = None
@@ -1669,6 +1729,11 @@ class TimelineWidget(QWidget):
             replace_action.setCheckable(True)
             replace_action.setChecked(self._added_audio_replace)
             audio_volume_action = menu.addAction("Volume...")
+            # Mute is a separate override from the stored volume, so it reads
+            # as its own toggle rather than a "0%" entry in the volume dialog.
+            audio_mute_action = menu.addAction(
+                "Unmute Audio" if clicked_audio.muted else "Mute Audio",
+            )
             remove_this_action = menu.addAction("Remove This Audio Clip")
             if len(self._added_audios) > 1:
                 remove_all_action = menu.addAction("Remove All Added Audio")
@@ -1709,6 +1774,11 @@ class TimelineWidget(QWidget):
             return
         if audio_volume_action is not None and chosen is audio_volume_action:
             self.addedAudioVolumeRequested.emit(clicked_audio.id)
+            return
+        if audio_mute_action is not None and chosen is audio_mute_action:
+            # The widget owns no model state: MainWindow snapshots for undo
+            # and writes the authoritative item.
+            self.addedAudioMuteRequested.emit(clicked_audio.id)
             return
         if add_lane_action is not None and chosen is add_lane_action:
             self.add_audio_lane()

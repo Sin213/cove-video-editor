@@ -21,6 +21,11 @@ class AddedAudio:
 
     `volume` is a per-item linear gain (1.0 = 100%, 0.0 = silent, 2.0 = 200%)
     applied on top of the global added-audio gain.
+
+    `muted` is an independent temporary override: while it is set the item
+    plays and exports at zero gain, but `volume` keeps the value it had, so
+    unmuting restores it. A stored `volume` of 0.0 is *not* the same state
+    as `muted` - only an explicit mute sets the flag.
     """
     path: Path
     duration: float = 0.0
@@ -31,6 +36,7 @@ class AddedAudio:
     src_start: float = 0.0
     src_end: float = 0.0
     volume: float = 1.0
+    muted: bool = False
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
 
     def __post_init__(self) -> None:
@@ -58,7 +64,7 @@ class AddedAudio:
             path=self.path, duration=self.duration, rate=self.rate,
             peaks=list(self.peaks), offset=self.offset, lane=self.lane,
             src_start=self.src_start, src_end=self.src_end,
-            volume=self.volume,
+            volume=self.volume, muted=self.muted,
         )
         a.id = self.id
         return a

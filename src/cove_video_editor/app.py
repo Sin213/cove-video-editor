@@ -1273,6 +1273,7 @@ class MainWindow(QMainWindow):
         self.timeline.addedAudioOffsetChanged.connect(self._on_added_audio_offset_changed)
         self.timeline.addedAudioRangeChanged.connect(self._on_added_audio_range_changed)
         self.timeline.addedAudioVolumeRequested.connect(self._on_added_audio_volume_requested)
+        self.timeline.addedAudioMuteRequested.connect(self._on_added_audio_mute_requested)
         self.timeline.clipDoubleClicked.connect(self._open_clip_properties)
         self.timeline.audioLinkToggled.connect(self._on_audio_link_toggled)
         self.timeline.clipDeleteRequested.connect(self._on_clip_delete_requested)
@@ -2834,7 +2835,11 @@ class MainWindow(QMainWindow):
         # Each added-audio item scales the global gain by its own volume.
         # QAudioOutput accepts 0.0-1.0, so anything above 100% is clamped in
         # preview only — export keeps the exact value.
-        item_volumes = {a.id: a.volume for a in self._added_audios}
+        # An explicitly muted item forces its own factor to zero without
+        # touching the stored volume, so the master gain cannot revive it.
+        item_volumes = {
+            a.id: (0.0 if a.muted else a.volume) for a in self._added_audios
+        }
         for aid, out in self._added_outputs.items():
             item_vol = item_volumes.get(aid, 1.0)
             out.setVolume(max(0.0, min(1.0, added_gain * item_vol)))
@@ -3158,6 +3163,21 @@ class MainWindow(QMainWindow):
         self._refresh_added_audio_display()
         self._update_audio_volumes()
         self.status.showMessage(f"Added audio volume set to {pct}%.", 3000)
+
+    def _on_added_audio_mute_requested(self, audio_id: str) -> None:
+        """Toggle one added-audio item's explicit mute. `volume` is left
+        exactly as it was, so unmuting returns to the stored gain rather
+        than to 100%. One toggle is one undo point."""
+        audio = next((a for a in self._added_audios if a.id == audio_id), None)
+        if audio is None:
+            return
+        self._snapshot()
+        audio.muted = not audio.muted
+        self._refresh_added_audio_display()
+        self._update_audio_volumes()
+        self.status.showMessage(
+            "Added audio muted." if audio.muted else "Added audio unmuted.", 3000,
+        )
 
     def _on_added_audio_range_changed(self, audio_id: str) -> None:
         self._snapshot()
@@ -3568,6 +3588,29 @@ class MainWindow(QMainWindow):
                 "Automatic and CPU both encode on the processor."
             )
 
+    def _build_added_audio_tracks(self) -> list[AudioTrack]:
+        """One `AudioTrack` per added-audio item, at its effective gain.
+
+        A muted item contributes zero regardless of its stored volume or the
+        master added-audio gain; everything else (replacement, placement,
+        trim) is unaffected. Read-only: the model is never written here, so
+        an item is still muted at its stored volume after an export."""
+        replace = self.audio_replace_cb.isChecked()
+        vol = self.audio_gain.value()
+        orig_vol = self.orig_gain.value()
+        return [
+            AudioTrack(
+                path=audio.path,
+                replace=replace,
+                volume=0.0 if audio.muted else audio.volume * vol,
+                original_volume=orig_vol,
+                offset=audio.offset,
+                duration=audio.src_span,
+                src_start=audio.src_start,
+            )
+            for audio in self._added_audios
+        ]
+
     def _on_export_clicked(self) -> None:
         fmt_key = self.format_combo.currentText()
         spec = ff.EXPORT_FORMATS[fmt_key]
@@ -3585,22 +3628,7 @@ class MainWindow(QMainWindow):
         if not out_path:
             return
 
-        audio_tracks: list[AudioTrack] = []
-        replace = self.audio_replace_cb.isChecked()
-        vol = self.audio_gain.value()
-        orig_vol = self.orig_gain.value()
-        for audio in self._added_audios:
-            audio_tracks.append(
-                AudioTrack(
-                    path=audio.path,
-                    replace=replace,
-                    volume=audio.volume * vol,
-                    original_volume=orig_vol,
-                    offset=audio.offset,
-                    duration=audio.src_span,
-                    src_start=audio.src_start,
-                )
-            )
+        audio_tracks = self._build_added_audio_tracks()
 
         region_start = region_end = None
         if self._region_export_range is not None:
