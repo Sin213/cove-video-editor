@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import os
 import sys
 import time
@@ -28,6 +29,7 @@ from PySide6.QtGui import (
     QDropEvent,
     QFont,
     QFontDatabase,
+    QFontMetricsF,
     QIcon,
     QImage,
     QKeySequence,
@@ -38,6 +40,7 @@ from PySide6.QtGui import (
     QPixmap,
     QRegion,
     QShortcut,
+    QTransform,
 )
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
@@ -631,6 +634,95 @@ def available_subtitle_fonts() -> list[str]:
     return picks or [QApplication.font().family()]
 
 
+# --- confirmed-crop preview visualization ------------------------------
+#
+# Read-only companion to the interactive CropOverlay: once a crop is
+# committed and the editor is closed, the preview keeps showing the whole
+# source frame and darkens only what the crop will discard. Purely a
+# foreground paint - no scene geometry, no player and no model is touched.
+
+# Dark enough to read as "this is going away" while still leaving the
+# discarded content legible as context.
+_CROP_MATTE_COLOR = QColor(0, 0, 0, 175)
+# The same accent CropOverlay draws its handles and rect in, so the
+# committed frame and the editable one read as the same object.
+_CROP_ACCENT_COLOR = QColor("#5fb4ff")
+_CROP_PILL_BG_COLOR = QColor(13, 18, 22, 210)
+# Cosmetic: the pen width is in device pixels, so fitInView's scale (which
+# is ~0.33 at 640px for a 1920px source) cannot thin or fatten the line.
+_CROP_BORDER_PEN = QPen(_CROP_ACCENT_COLOR, 1.5)
+_CROP_BORDER_PEN.setCosmetic(True)
+_CROP_PILL_INSET = 8.0
+_CROP_PILL_PAD_X = 7.0
+_CROP_PILL_PAD_Y = 3.0
+_CROP_PILL_RADIUS = 4.0
+# Below this the rect is full-frame for display purposes. Generous enough
+# to absorb float noise from an externally-authored rect, far tighter than
+# any crop a user could produce by dragging.
+_CROP_FULL_FRAME_EPS = 1e-6
+
+
+def crop_badge_label(preset_name: str) -> str:
+    """The compact pill text for a committed preset.
+
+    Delegates to the crop registry's own ``compact_preset_label`` so there
+    is exactly one preset parser. The only divergence is the fallback: the
+    toolbar says "Active" (answering "is there a crop?"), while a badge
+    sitting inside the crop rectangle already establishes that, so it just
+    names the thing - "Crop".
+    """
+    label = compact_preset_label(preset_name)
+    return "Crop" if label == "Active" else label
+
+
+def _effective_crop_rect(
+    rect: tuple[float, float, float, float] | None,
+) -> tuple[float, float, float, float] | None:
+    """``rect`` as a drawable crop, or ``None`` if there is nothing to show.
+
+    Rejects the full frame - the UI canonicalizes it to ``None`` but an
+    externally-built ``Clip`` may carry ``(0,0,1,1)`` - along with
+    degenerate and non-finite geometry. Presentation refuses to guess:
+    a wrong matte is a confident lie about framing.
+    """
+    if rect is None:
+        return None
+    try:
+        x, y, w, h = (float(v) for v in rect)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(v) for v in (x, y, w, h)):
+        return None
+    if w <= 0.0 or h <= 0.0:
+        return None
+    if (
+        x <= _CROP_FULL_FRAME_EPS and y <= _CROP_FULL_FRAME_EPS
+        and w >= 1.0 - _CROP_FULL_FRAME_EPS and h >= 1.0 - _CROP_FULL_FRAME_EPS
+    ):
+        return None
+    return (x, y, w, h)
+
+
+def _crop_matte_regions(source: QRectF, crop: QRectF) -> list[QRectF]:
+    """The four non-overlapping bands of ``source`` outside ``crop``.
+
+    Painting bands rather than a filled path minus a hole keeps the crop
+    interior at exactly full brightness: no seam, no double-coverage and
+    no alpha accumulating where two rectangles would otherwise meet.
+    """
+    bands = (
+        QRectF(source.left(), source.top(),
+               source.width(), crop.top() - source.top()),
+        QRectF(source.left(), crop.bottom(),
+               source.width(), source.bottom() - crop.bottom()),
+        QRectF(source.left(), crop.top(),
+               crop.left() - source.left(), crop.height()),
+        QRectF(crop.right(), crop.top(),
+               source.right() - crop.right(), crop.height()),
+    )
+    return [r for r in bands if r.width() > 0.0 and r.height() > 0.0]
+
+
 class VideoView(QGraphicsView):
     clicked = Signal()
     contextMenuRequestedAt = Signal(object)   # QPoint (global)
@@ -672,6 +764,11 @@ class VideoView(QGraphicsView):
         self.sub_fill.setVisible(False)
         self._scene.addItem(self.sub_fill)
         self._scene.setSceneRect(QRectF(0, 0, 640, 360))
+        # Confirmed-crop presentation state. Deliberately immutable data
+        # only - a normalized rect and a finished string. The view never
+        # learns what a Clip is, so paint can never resolve the wrong one.
+        self._crop_rect: tuple[float, float, float, float] | None = None
+        self._crop_label: str = ""
 
     def video_output(self) -> QGraphicsVideoItem:
         return self.video_item
@@ -750,6 +847,120 @@ class VideoView(QGraphicsView):
     def hide_subtitle(self) -> None:
         self.sub_outline.setVisible(False)
         self.sub_fill.setVisible(False)
+
+    # --- confirmed crop indicator ------------------------------------
+
+    def set_crop_indicator(
+        self,
+        crop_rect: tuple[float, float, float, float] | None,
+        label: str = "",
+    ) -> None:
+        """Show ``crop_rect`` (normalized source coords) as a confirmed crop.
+
+        ``None`` - and anything that is not an effective crop - clears the
+        indicator. Repainting is skipped when nothing actually changed:
+        the playhead-driven preview sync calls this on every timer tick.
+        """
+        rect = _effective_crop_rect(crop_rect)
+        text = str(label) if rect is not None else ""
+        if (rect, text) == (self._crop_rect, self._crop_label):
+            return
+        self._crop_rect = rect
+        self._crop_label = text
+        self.viewport().update()
+
+    def crop_indicator_rect(self) -> tuple[float, float, float, float] | None:
+        return self._crop_rect
+
+    def crop_indicator_label(self) -> str:
+        return self._crop_label
+
+    def crop_indicator_geometry(self) -> tuple[QRectF, QRectF] | None:
+        """``(source, crop)`` in viewport pixels, or ``None`` if not drawable.
+
+        Both the video item and the image item are laid out at the scene
+        origin at native size (see ``set_native_size`` / ``show_image``),
+        so the scene rect *is* the displayed source rectangle - the same
+        rectangle the normalized crop is expressed against, for video and
+        stills alike. Computed fresh from the live view transform so a
+        resize or refit needs no cache invalidation.
+        """
+        norm = self._crop_rect
+        if norm is None:
+            return None
+        source = self._scene.sceneRect()
+        if source.isEmpty():
+            return None
+        x, y, w, h = norm
+        crop_scene = QRectF(
+            source.left() + x * source.width(),
+            source.top() + y * source.height(),
+            w * source.width(), h * source.height(),
+        )
+        transform: QTransform = self.viewportTransform()
+        source_vp = transform.mapRect(source)
+        crop_vp = transform.mapRect(crop_scene).intersected(source_vp)
+        if crop_vp.width() <= 0.0 or crop_vp.height() <= 0.0:
+            return None
+        return source_vp, crop_vp
+
+    def crop_pill_rect(self, crop_vp: QRectF) -> QRectF | None:
+        """Where the ratio pill goes inside ``crop_vp``, or ``None``.
+
+        Suppressed rather than shrunk when the crop is too small: an
+        illegible badge is worse than the matte and border alone, which
+        already say everything the pill would.
+        """
+        if not self._crop_label:
+            return None
+        metrics = QFontMetricsF(self._crop_pill_font())
+        w = metrics.horizontalAdvance(self._crop_label) + _CROP_PILL_PAD_X * 2
+        h = metrics.height() + _CROP_PILL_PAD_Y * 2
+        if (crop_vp.width() < w + _CROP_PILL_INSET * 2
+                or crop_vp.height() < h + _CROP_PILL_INSET * 2):
+            return None
+        return QRectF(
+            crop_vp.left() + _CROP_PILL_INSET,
+            crop_vp.top() + _CROP_PILL_INSET, w, h,
+        )
+
+    def _crop_pill_font(self) -> QFont:
+        font = QFont(self.font())
+        font.setBold(True)
+        return font
+
+    def drawForeground(self, painter: QPainter, rect: QRectF) -> None:
+        super().drawForeground(painter, rect)
+        geometry = self.crop_indicator_geometry()
+        if geometry is None:
+            return
+        source_vp, crop_vp = geometry
+        painter.save()
+        try:
+            # Viewport pixels, not scene pixels: matte edges, line width,
+            # pill padding and font size must not scale with fitInView.
+            painter.resetTransform()
+            painter.setOpacity(1.0)
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(_CROP_MATTE_COLOR))
+            for band in _crop_matte_regions(source_vp, crop_vp):
+                painter.drawRect(band)
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(_CROP_BORDER_PEN)
+            painter.drawRect(crop_vp)
+            pill = self.crop_pill_rect(crop_vp)
+            if pill is not None:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(_CROP_PILL_BG_COLOR))
+                painter.drawRoundedRect(
+                    pill, _CROP_PILL_RADIUS, _CROP_PILL_RADIUS,
+                )
+                painter.setFont(self._crop_pill_font())
+                painter.setPen(QPen(_CROP_ACCENT_COLOR))
+                painter.drawText(pill, Qt.AlignCenter, self._crop_label)
+        finally:
+            painter.restore()
 
     def set_native_size(self, width: int, height: int) -> None:
         self.video_item.setSize(QSizeF(width, height))
@@ -1128,6 +1339,7 @@ class MainWindow(QMainWindow):
         else:
             self._preview_clip_id = ""
             self.player.setSource(QUrl())
+            self._sync_crop_indicator()
         # `_set_preview_clip()` refreshes the output gains, but the clipless
         # branch above doesn't — an audio-only timeline would keep the
         # pre-undo per-item added-audio gain on its live QAudioOutputs.
@@ -2065,6 +2277,7 @@ class MainWindow(QMainWindow):
             if self._preview_clip_id in {c.id for c in affected}:
                 self._preview_clip_id = ""
                 self.player.setSource(QUrl())
+                self._sync_crop_indicator()
         # Drop any added-audio entries that referenced this asset's path.
         doomed = [a.id for a in self._added_audios if a.path == asset.path]
         if doomed:
@@ -2208,6 +2421,7 @@ class MainWindow(QMainWindow):
             if pm is not None:
                 self.video_view.show_image(pm, clip.asset.width, clip.asset.height)
             self._update_audio_volumes()
+            self._sync_crop_indicator()
             return
         # Video path (unchanged).
         self.video_view.hide_image()
@@ -2229,6 +2443,7 @@ class MainWindow(QMainWindow):
         self.clip_audio_player.pause()
         self.clip_audio_player.setSource(QUrl.fromLocalFile(str(clip.path)))
         self._update_audio_volumes()
+        self._sync_crop_indicator()
 
     def _kick_off_thumbs(self, clip: Clip) -> None:
         # More thumbs for longer clips so the strip actually shows the scene
@@ -2737,6 +2952,7 @@ class MainWindow(QMainWindow):
         self.clip_audio_player.pause()
         self.clip_audio_player.setSource(QUrl())
         self._preview_clip_id = ""
+        self._sync_crop_indicator()
         if not self._added_audios:
             # Nothing at all to play — fully stop playback.
             if self._play_timer.isActive():
@@ -2931,9 +3147,18 @@ class MainWindow(QMainWindow):
                 self.player.pause()
             self.video_view.set_video_visible(False)
             self.video_view.hide_image()
+            # Nothing is on screen, so `_preview_clip_id` no longer
+            # describes what the user is looking at: hide rather than
+            # keep matting a picture that is not there.
+            self.video_view.set_crop_indicator(None)
             return
         if clip.id != self._preview_clip_id:
             self._set_preview_clip(clip)
+        else:
+            # Same clip id, but the previous tick may have blanked the
+            # indicator on a gap - or undo may have re-committed the crop
+            # under the same preview. Cheap and idempotent.
+            self._sync_crop_indicator()
         if clip.asset.kind == "image":
             # Keep the image pinned on screen. The play timer continues to
             # advance the playhead so the image clip occupies its timeline
@@ -3260,6 +3485,11 @@ class MainWindow(QMainWindow):
         self.crop_fit_btn.setVisible(editing)
         self.crop_reset_btn.setVisible(editing)
         self.crop_confirm_btn.setVisible(editing)
+        # Entering an edit retires the confirmed visualization; leaving one
+        # brings it back from whatever is committed *now*, so Confirm and
+        # Cancel both resync through the same path and neither can leave a
+        # stale rectangle behind.
+        self._sync_crop_indicator()
 
     def _uncheck_crop_button(self) -> None:
         """Drop the Crop button without running the user-cancel path."""
@@ -3371,6 +3601,23 @@ class MainWindow(QMainWindow):
             self.crop_btn.setText("Crop")
             return
         self.crop_btn.setText(f"Crop ({compact_preset_label(c.crop_preset)})")
+
+    def _sync_crop_indicator(self) -> None:
+        """Point the confirmed-crop visualization at the *previewed* clip.
+
+        Not the selected clip: playback walks the preview from one clip to
+        the next without changing the selection, and leaving clip A's
+        matte over clip B's picture would misrepresent B's framing. An
+        open draft hides the indicator outright so the interactive overlay
+        is never stacked on top of a second, static crop rectangle.
+        """
+        clip = None if self._crop_edit_clip_id else self._current_preview_clip()
+        if clip is None or clip.crop_rect is None:
+            self.video_view.set_crop_indicator(None)
+            return
+        self.video_view.set_crop_indicator(
+            clip.crop_rect, crop_badge_label(clip.crop_preset),
+        )
 
     def _sync_crop_overlay_aspect(self) -> None:
         """Point the overlay at the edited clip's source aspect, if any."""
