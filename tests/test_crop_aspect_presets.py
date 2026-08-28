@@ -762,16 +762,38 @@ class TestCropControlWiring(unittest.TestCase, _GeometryAsserts):
         self.assertEqual(w.crop_overlay.normalized_rect(), before)
         self.assertIsNone(w.crop_overlay.aspect_ratio_preset())
 
-    def test_h6_crop_toggle_keeps_an_edited_locked_crop(self) -> None:
+    def test_h6_a_confirmed_crop_survives_a_toggle_cycle(self) -> None:
+        """Retargeted by Tab 2I-C.
+
+        Toggling Crop off is now Cancel, so an *unconfirmed* edit is
+        supposed to be discarded on the way out. The invariant worth
+        keeping is the one the user actually cares about: a crop they
+        confirmed comes back byte-for-byte on the next toggle cycle.
+        """
         w = _win()
         w.crop_btn.setChecked(True)
         w.crop_aspect_combo.setCurrentText("1:1 (Square / Instagram)")
         edited = QRectF(0.05, 0.10, 0.30, 0.5333)
         w.crop_overlay.set_normalized_rect(edited)
         before = w.crop_overlay.normalized_rect()
-        w.crop_btn.setChecked(False)
+        w.crop_confirm_btn.click()
         w.crop_btn.setChecked(True)
         self.assertEqual(w.crop_overlay.normalized_rect(), before)
+        self.assertAlmostEqual(
+            w.crop_overlay.aspect_ratio_preset(), 1.0, places=12,
+        )
+
+    def test_h6_an_unconfirmed_crop_is_discarded_by_a_toggle_cycle(self) -> None:
+        w = _win()
+        w.crop_btn.setChecked(True)
+        w.crop_aspect_combo.setCurrentText("1:1 (Square / Instagram)")
+        w.crop_overlay.set_normalized_rect(QRectF(0.05, 0.10, 0.30, 0.5333))
+        w.crop_btn.setChecked(False)
+        w.crop_btn.setChecked(True)
+        self.assertEqual(
+            w.crop_overlay.normalized_rect(), QRectF(0.0, 0.0, 1.0, 1.0),
+        )
+        self.assertIsNone(w._clips[0].crop_rect)
 
     def test_h10_no_selected_clip_does_not_crash(self) -> None:
         w = _win(with_clip=False)
@@ -781,24 +803,48 @@ class TestCropControlWiring(unittest.TestCase, _GeometryAsserts):
         self.assertEqual(w.crop_aspect_combo.currentText(), "Free (Custom)")
         self.assertIsNone(w.crop_overlay.aspect_ratio_preset())
 
-    def test_crop_entry_keeps_the_free_default_inset(self) -> None:
-        """Existing behaviour: Free + untouched crop enters at 10% inset."""
+    def test_crop_entry_on_an_uncropped_clip_starts_full_frame_free(self) -> None:
+        """Retargeted by Tab 2I-C.
+
+        Crop entry used to seed a transient 10% inset because the overlay
+        was global scratch state with nothing to restore from. Entry is
+        now scoped to the selected clip's *committed* crop, and an
+        uncropped clip has none, so the session starts at the whole frame
+        in Free. The surviving Tab 2F invariant - Free entry carries no
+        aspect lock - is asserted below.
+        """
         w = _win()
         w.crop_btn.setChecked(True)
         self.assertEqual(
-            w.crop_overlay.normalized_rect(), QRectF(0.1, 0.1, 0.8, 0.8),
+            w.crop_overlay.normalized_rect(), QRectF(0.0, 0.0, 1.0, 1.0),
         )
+        self.assertIsNone(w.crop_overlay.aspect_ratio_preset())
+        self.assertEqual(w.crop_aspect_combo.currentText(), "Free (Custom)")
 
-    def test_crop_entry_applies_an_already_selected_preset(self) -> None:
+    def test_crop_entry_applies_the_committed_preset(self) -> None:
+        """Retargeted by Tab 2I-C.
+
+        Entry used to re-apply whatever the selector happened to hold.
+        The clip's committed preset is the authority now, and leftover
+        selector state must not leak into a clip that never had it.
+        """
         w = _win()
-        w.crop_aspect_combo.setCurrentText("1:1 (Square / Instagram)")
-        w.crop_overlay.reset()
         w.crop_aspect_combo.blockSignals(True)
-        w.crop_aspect_combo.setCurrentText("1:1 (Square / Instagram)")
+        w.crop_aspect_combo.setCurrentText("21:9 (Cinematic / Ultrawide)")
         w.crop_aspect_combo.blockSignals(False)
+        clip = w._clips[0]
+        clip.crop_rect = (0.2, 0.0, 0.6, 1.0)
+        clip.crop_preset = "1:1 (Square / Instagram)"
         w.crop_btn.setChecked(True)
-        self.assert_max_area_centered(
-            w.crop_overlay.normalized_rect(), *self.SRC, 1.0,
+        self.assertAlmostEqual(
+            w.crop_overlay.aspect_ratio_preset(), 1.0, places=12,
+        )
+        self.assertEqual(
+            w.crop_aspect_combo.currentText(), "1:1 (Square / Instagram)",
+        )
+        # The stored rectangle wins over the preset's centred default.
+        self.assertEqual(
+            w.crop_overlay.normalized_rect(), QRectF(0.2, 0.0, 0.6, 1.0),
         )
 
 

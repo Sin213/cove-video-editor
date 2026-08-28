@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QKeyEvent, QMouseEvent, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
 
@@ -24,6 +24,19 @@ CROP_ASPECT_PRESETS: dict[str, float | None] = {
 }
 
 
+def compact_preset_label(preset_name: str) -> str:
+    """Short status tag for a committed preset display key.
+
+    ``"9:16 (TikTok / Reels / Shorts)"`` becomes ``"9:16"``. Free and any
+    unrecognised key become ``"Active"``: a hand-adjusted crop has no
+    ratio worth naming, and inventing one from arbitrary text would lie.
+    The registry above stays the single source of preset truth.
+    """
+    if CROP_ASPECT_PRESETS.get(preset_name) is None:
+        return "Active"
+    return preset_name.split(" ")[0]
+
+
 class CropOverlay(QWidget):
     """Draggable crop rectangle in normalized 0..1 source coords.
 
@@ -36,10 +49,16 @@ class CropOverlay(QWidget):
     """
 
     cropChanged = Signal(QRectF)
+    #: The user asked to apply the current draft. Purely an intent signal -
+    #: the overlay owns no document state and commits nothing itself.
+    confirmRequested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setMouseTracking(True)
+        # Return/Enter is an accelerator scoped to this widget rather than a
+        # window-wide shortcut, so the timecode field keeps its own Return.
+        self.setFocusPolicy(Qt.StrongFocus)
         self._video_aspect: float = 16 / 9
         self._aspect_lock: float | None = None
         self._preset_name: str = FREE_PRESET
@@ -81,6 +100,10 @@ class CropOverlay(QWidget):
 
     def aspect_ratio_preset(self) -> float | None:
         return self._aspect_lock
+
+    def preset_name(self) -> str:
+        """The display key of the draft's current preset."""
+        return self._preset_name
 
     def aspect_badge_text(self) -> str | None:
         """Compact ratio tag for the on-canvas pill, or ``None`` when free."""
@@ -249,6 +272,27 @@ class CropOverlay(QWidget):
             self._drag_start_widget = event.position()
             self._drag_start_rect = QRectF(self._rect_norm)
             event.accept()
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        """Double-clicking the crop body is a shortcut for Confirm.
+
+        Only the body counts. A double-click on a resize handle or outside
+        the box is an ordinary sizing gesture, and a live drag target means
+        the user is still adjusting - confirming there would apply a rect
+        they were in the middle of changing.
+        """
+        if event.button() != Qt.LeftButton or self._drag_target is not None:
+            return
+        if self._hit_test(event.position()) == "move":
+            self.confirmRequested.emit()
+            event.accept()
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            self.confirmRequested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         if self._drag_target:

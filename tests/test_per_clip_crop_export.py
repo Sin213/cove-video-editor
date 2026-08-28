@@ -619,12 +619,39 @@ class AudioAndRegionTests(unittest.TestCase):
 
 
 class StructuralScopeTests(unittest.TestCase):
-    def test_l1_app_does_not_consume_committed_crop_state(self) -> None:
-        """The GUI still exports through the legacy global crop; per-clip
-        export stays dormant until the crop lifecycle slice lands."""
+    def test_l1_the_legacy_global_crop_field_is_still_populated(self) -> None:
+        """Retargeted by Tab 2I-C.
+
+        This guard used to assert the GUI never touched ``crop_rect``,
+        because per-clip export was dormant. The crop lifecycle slice
+        lights it up, so the premise is retired. What still holds - and
+        is what the guard was really protecting - is that ``ExportJob``
+        keeps its legacy global ``crop`` field and the GUI keeps feeding
+        it, so no exporter behaviour changed underneath 2I-B.
+        """
         app_src = (SRC / "app.py").read_text(encoding="utf-8")
-        self.assertNotIn("crop_rect", app_src)
         self.assertIn("crop=self._crop_pixels()", app_src)
+
+    def test_l1_an_open_crop_draft_cannot_reach_the_legacy_global_crop(
+        self,
+    ) -> None:
+        """Export closes crop mode first, and `_crop_pixels()` only reports
+        while crop mode is on - so the two can never both be live."""
+        import inspect
+
+        from cove_video_editor.app import MainWindow
+
+        export_src = inspect.getsource(MainWindow._on_export_clicked)
+        confirm_at = export_src.index("_finish_crop_edit(commit=True)")
+        job_at = export_src.index("crop=self._crop_pixels()")
+        self.assertLess(
+            confirm_at, job_at,
+            "the draft must be committed before the job is built",
+        )
+        self.assertIn(
+            "self.crop_btn.isChecked()",
+            inspect.getsource(MainWindow._crop_pixels),
+        )
 
     def test_m1_rejected_canvas_fit_architecture_is_absent(self) -> None:
         for name in ("exporter.py", "clip.py", "crop_overlay.py", "app.py"):

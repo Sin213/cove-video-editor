@@ -238,11 +238,29 @@ class CropDormancyGuardTests(unittest.TestCase):
         self.assertEqual(c.src_for_timeline(4.0), 3.0)
         self.assertIsNone(c.crop_rect)
 
-    def test_g2_no_ui_module_reads_committed_crop_state(self) -> None:
-        for module in ("app.py", "crop_overlay.py", "timeline_widget.py"):
+    def test_g2_only_the_commit_layer_touches_committed_crop_state(self) -> None:
+        """Retargeted by Tab 2I-C.
+
+        Tab 2I-A was a dormant foundation, so *no* UI module was allowed
+        to read the committed fields. The crop lifecycle slice makes
+        ``app.py`` the commit layer, which is exactly where that write
+        belongs. The still-valid half of the guard is that nothing else
+        joins it: ``CropOverlay`` owns the draft and emits intent only,
+        and the timeline draws clips without knowing about crop at all.
+        """
+        for module in ("crop_overlay.py", "timeline_widget.py"):
             src = self._source(module)
             self.assertNotIn(".crop_rect", src, module)
             self.assertNotIn(".crop_preset", src, module)
+
+    def test_g2_the_commit_layer_writes_both_committed_fields(self) -> None:
+        import inspect
+
+        from cove_video_editor.app import MainWindow
+
+        src = inspect.getsource(MainWindow._finish_crop_edit)
+        self.assertIn("crop_rect", src)
+        self.assertIn("crop_preset", src)
 
     def test_g3_ffmpeg_utils_does_not_read_committed_crop_state(self) -> None:
         """Tab 2I-B deliberately taught ``exporter.py`` to read

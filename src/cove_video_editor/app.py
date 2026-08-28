@@ -104,7 +104,9 @@ from .clip import (
     split_clip,
 )
 from .clip_bin import ASSET_MIME, ClipBin
-from .crop_overlay import CROP_ASPECT_PRESETS, CropOverlay
+from .crop_overlay import (
+    CROP_ASPECT_PRESETS, FREE_PRESET, CropOverlay, compact_preset_label,
+)
 from .downloader import DownloadVideoDialog
 from .exporter import AudioTrack, ExportJob, start_export
 from .thumbnails import start_thumbnails, start_waveform
@@ -824,6 +826,20 @@ class MainWindow(QMainWindow):
         self._redo_stack: list[dict] = []
         self._undo_limit: int = 80
 
+        # Crop edit session. While one is open the crop overlay holds a
+        # *draft*: nothing is written to the clip until Confirm. The owner
+        # is pinned by id rather than by object because undo/redo swap in
+        # clones, and a stale reference would commit into an orphan. The
+        # session-start values are the cancel snapshot; the overlay itself
+        # cannot serve as one because the draft mutates it in place.
+        self._crop_edit_clip_id: str = ""
+        self._crop_edit_start_rect: tuple[float, float, float, float] | None = None
+        self._crop_edit_start_preset: str = FREE_PRESET
+        # Set while the lifecycle unchecks the Crop button itself, so the
+        # button-off handler does not read that as a user cancel and undo
+        # the commit that just happened.
+        self._crop_finalizing: bool = False
+
         # Hardware encoder probing plumbing. Never touched on the GUI
         # thread: `_start_encoder_probe` hands the real ffmpeg probes to a
         # worker and the results come back queued.
@@ -1047,12 +1063,24 @@ class MainWindow(QMainWindow):
         return {
             "clips": [c.clone() for c in self._clips],
             "selected_id": self.timeline.selected_id() if hasattr(self, "timeline") else "",
+            # Position of the selected clip. `Clip.clone()` mints a fresh
+            # id, so `selected_id` cannot survive the snapshot/restore
+            # round trip; the index is parallel to `clips` and can.
+            "selected_index": self._selected_clip_index(),
             "playhead": self.timeline.playhead() if hasattr(self, "timeline") else 0.0,
             "added_audios": [a.clone() for a in self._added_audios],
             "replace_audio": self.audio_replace_cb.isChecked() if hasattr(self, "audio_replace_cb") else False,
             "added_gain": self.audio_gain.value() if hasattr(self, "audio_gain") else 1.0,
             "orig_gain": self.orig_gain.value() if hasattr(self, "orig_gain") else 1.0,
         }
+
+    def _selected_clip_index(self) -> int:
+        if not hasattr(self, "timeline"):
+            return -1
+        sid = self.timeline.selected_id()
+        return next(
+            (i for i, c in enumerate(self._clips) if c.id == sid), -1,
+        )
 
     def _snapshot(self) -> None:
         """Record the current state as an undo point. Any queued redo
@@ -1079,6 +1107,15 @@ class MainWindow(QMainWindow):
         self._refresh_added_audio_display()
 
         sid = snap["selected_id"] or (self._clips[0].id if self._clips else "")
+        # Restored clips are clones with fresh ids, so the stored id never
+        # resolves; re-point it at the same position instead. Without this
+        # every restore leaves a dangling selection and silently disables
+        # the clip-scoped tools, crop included.
+        idx = snap.get("selected_index", -1)
+        if 0 <= idx < len(self._clips):
+            sid = self._clips[idx].id
+        elif sid and not any(c.id == sid for c in self._clips):
+            sid = self._clips[0].id if self._clips else ""
         if sid:
             self.timeline.select_clip(sid)
         self.timeline.set_playhead(snap["playhead"], emit=False)
@@ -1104,6 +1141,11 @@ class MainWindow(QMainWindow):
         self._drive_main_player_from_playhead()
 
     def _undo(self) -> None:
+        # Undo asks to move *backwards* through committed history, so an
+        # open draft is discarded rather than auto-confirmed: committing it
+        # first and immediately undoing something else would be baffling.
+        # It also clears the session before `_apply_state` swaps in clones.
+        self._cancel_crop_edit_for_history()
         if not self._undo_stack:
             self.status.showMessage("Nothing to undo.", 2000)
             return
@@ -1113,6 +1155,7 @@ class MainWindow(QMainWindow):
         self.status.showMessage("Undone.", 1500)
 
     def _redo(self) -> None:
+        self._cancel_crop_edit_for_history()
         if not self._redo_stack:
             self.status.showMessage("Nothing to redo.", 2000)
             return
@@ -1122,6 +1165,25 @@ class MainWindow(QMainWindow):
         snap = self._redo_stack.pop()
         self._apply_state(snap)
         self.status.showMessage("Redone.", 1500)
+
+    def _cancel_crop_edit_for_history(self) -> None:
+        """Drop any open crop draft before undo/redo replaces the clips."""
+        if self._crop_edit_clip_id:
+            self._finish_crop_edit(commit=False)
+
+    def _cancel_crop_edit_for_region_change(self) -> None:
+        """Drop any open crop draft before a region edit rebuilds the clips.
+
+        Region delete and region crop replace the whole list: the owner can
+        be dropped outright, and survivors are trimmed and shifted. Neither
+        emits a selection change - `TimelineWidget.set_clips()` just clears
+        a selected id that no longer resolves - so nothing else would close
+        the editor, leaving the overlay live over stale geometry or a clip
+        that is gone. Cancel rather than confirm: the gesture is a
+        destructive timeline edit, not a request to apply a crop.
+        """
+        if self._crop_edit_clip_id:
+            self._finish_crop_edit(commit=False)
 
     # --- UI construction ----------------------------------------------
 
@@ -1188,6 +1250,7 @@ class MainWindow(QMainWindow):
         self.video_view.contextMenuRequestedAt.connect(self._show_preview_menu)
         self.crop_overlay = CropOverlay(self.video_container)
         self.crop_overlay.setVisible(False)
+        self.crop_overlay.confirmRequested.connect(self._on_crop_confirm_clicked)
         self.video_container.installEventFilter(self)
         pv_lay.addWidget(self.video_container, stretch=1)
 
@@ -1328,6 +1391,13 @@ class MainWindow(QMainWindow):
         self.crop_reset_btn = QPushButton("Reset crop")
         self.crop_reset_btn.setVisible(False)
         self.crop_reset_btn.clicked.connect(self._on_crop_reset)
+        self.crop_confirm_btn = QPushButton("Confirm")
+        self.crop_confirm_btn.setToolTip(
+            "Apply this crop to the selected clip (Enter, or double-click "
+            "inside the crop box)"
+        )
+        self.crop_confirm_btn.setVisible(False)
+        self.crop_confirm_btn.clicked.connect(self._on_crop_confirm_clicked)
         self.range_label = QLabel("—")
         self.range_label.setObjectName("RangeLabel")
 
@@ -1340,6 +1410,7 @@ class MainWindow(QMainWindow):
         transport.addWidget(self.crop_aspect_combo)
         transport.addWidget(self.crop_fit_btn)
         transport.addWidget(self.crop_reset_btn)
+        transport.addWidget(self.crop_confirm_btn)
         transport.addStretch(1)
         transport.addWidget(self.range_label)
         preview_lay.addWidget(transport_bar)
@@ -1982,6 +2053,8 @@ class MainWindow(QMainWindow):
         if asset is None:
             return
         affected = [c for c in self._clips if c.asset.id == asset_id]
+        if self._crop_edit_clip_id in {c.id for c in affected}:
+            self._finish_crop_edit(commit=False)
         # Snapshot before deleting so Ctrl+Z can bring it back (state only;
         # the bin tiles themselves aren't in the snapshot).
         self._snapshot()
@@ -2287,6 +2360,12 @@ class MainWindow(QMainWindow):
         pass
 
     def _on_clip_selected(self, clip_id: str) -> None:
+        # Leaving a clip means leaving its crop edit. Auto-confirm rather
+        # than discard: what the user can see on screen becomes the
+        # document state, and Escape stays the way to throw a draft away.
+        # Re-selecting the clip already being edited is not a departure.
+        if self._crop_edit_clip_id and self._crop_edit_clip_id != clip_id:
+            self._finish_crop_edit(commit=True)
         c = next((c for c in self._clips if c.id == clip_id), None)
         if c and self._preview_clip_id != c.id:
             self._set_preview_clip(c)
@@ -2627,6 +2706,10 @@ class MainWindow(QMainWindow):
                            message: str = "Clip deleted.") -> None:
         if not any(c.id == clip_id for c in self._clips):
             return
+        if self._crop_edit_clip_id == clip_id:
+            # The crop owner is going away; committing into it would write
+            # to an orphan. Other clips' sessions are unaffected.
+            self._finish_crop_edit(commit=False)
         self._snapshot()
         self._clips = [cc for cc in self._clips if cc.id != clip_id]
         if start_plan is not None:
@@ -2690,6 +2773,7 @@ class MainWindow(QMainWindow):
             self.status.showMessage(f"Selected region: {_fmt(start)} → {_fmt(end)}  ({_fmt(end - start)})", 0)
 
     def _on_region_delete(self, start: float, end: float) -> None:
+        self._cancel_crop_edit_for_region_change()
         self._snapshot()
         self._clips = delete_region(self._clips, start, end)
         self._delete_added_audio_region(start, end)
@@ -2702,6 +2786,7 @@ class MainWindow(QMainWindow):
             self._halt_playback_no_clips()
 
     def _on_region_crop(self, start: float, end: float) -> None:
+        self._cancel_crop_edit_for_region_change()
         self._snapshot()
         self._clips = keep_only_region(self._clips, start, end)
         self._crop_added_audio_to_region(start, end)
@@ -3123,29 +3208,173 @@ class MainWindow(QMainWindow):
 
     # --- crop ---------------------------------------------------------
 
-    def _on_crop_toggled(self, checked: bool) -> None:
+    def _crop_eligible_clip(self) -> Clip | None:
+        """The explicitly selected clip that may own a crop, or ``None``.
+
+        Deliberately not falling back to the preview clip: the preview
+        follows the playhead, so a fallback would let Confirm write into a
+        clip the user never selected.
+        """
         c = self._selected_clip()
-        if checked and not c:
-            self.crop_btn.setChecked(False)
+        if c is None or c.asset.kind not in ("video", "image"):
+            return None
+        if c.asset.width <= 0 or c.asset.height <= 0:
+            return None
+        return c
+
+    def _crop_edit_owner(self) -> Clip | None:
+        """The live clip object behind the session's owner id, if any."""
+        if not self._crop_edit_clip_id:
+            return None
+        return next(
+            (c for c in self._clips if c.id == self._crop_edit_clip_id), None,
+        )
+
+    def _on_crop_toggled(self, checked: bool) -> None:
+        if checked:
+            clip = self._crop_eligible_clip()
+            if clip is None:
+                self._uncheck_crop_button()
+                self.status.showMessage(
+                    "Select a video or image clip on the timeline to crop.",
+                    3500,
+                )
+                return
+            self._begin_crop_edit(clip)
+            self._set_crop_editing_visible(True)
+            # Return/Enter is scoped to this widget's focus, never global.
+            self.crop_overlay.setFocus(Qt.OtherFocusReason)
             return
-        if checked and c:
-            self.crop_overlay.set_video_aspect(c.asset.width / max(1, c.asset.height))
-            if self.crop_overlay.normalized_rect() == QRectF(0, 0, 1, 1):
-                preset_name = self.crop_aspect_combo.currentText()
-                ratio = CROP_ASPECT_PRESETS.get(preset_name)
-                if ratio is not None:
-                    self.crop_overlay.set_aspect_ratio_preset(ratio, preset_name)
-                else:
-                    self.crop_overlay.set_normalized_rect(QRectF(0.1, 0.1, 0.8, 0.8))
-        self.crop_overlay.setVisible(checked)
-        self.crop_overlay.raise_()
-        self.crop_aspect_combo.setVisible(checked)
-        self.crop_fit_btn.setVisible(checked)
-        self.crop_reset_btn.setVisible(checked)
+        # Turning Crop off by hand is a cancel. The one exception is the
+        # lifecycle unchecking the button as part of finishing a session,
+        # which has already decided what to do with the draft.
+        if not self._crop_finalizing:
+            self._finish_crop_edit(commit=False)
+        self._set_crop_editing_visible(False)
+
+    def _set_crop_editing_visible(self, editing: bool) -> None:
+        self.crop_overlay.setVisible(editing)
+        if editing:
+            self.crop_overlay.raise_()
+        self.crop_aspect_combo.setVisible(editing)
+        self.crop_fit_btn.setVisible(editing)
+        self.crop_reset_btn.setVisible(editing)
+        self.crop_confirm_btn.setVisible(editing)
+
+    def _uncheck_crop_button(self) -> None:
+        """Drop the Crop button without running the user-cancel path."""
+        if not self.crop_btn.isChecked():
+            return
+        self._crop_finalizing = True
+        try:
+            self.crop_btn.setChecked(False)
+        finally:
+            self._crop_finalizing = False
+
+    def _begin_crop_edit(self, clip: Clip) -> None:
+        """Open a draft session owned by ``clip``, seeded from its commit.
+
+        A committed rect is restored *after* the preset lock, because
+        applying a preset re-centres a maximum-area rectangle and would
+        otherwise throw away where the user had put the box.
+        """
+        self._crop_edit_clip_id = clip.id
+        self._crop_edit_start_rect = clip.crop_rect
+        # ``crop_rect=None`` means no effective crop no matter what preset
+        # metadata says, so the session starts Free at full frame.
+        self._crop_edit_start_preset = (
+            clip.crop_preset if clip.crop_rect is not None else FREE_PRESET
+        )
+        self.crop_overlay.set_video_aspect(
+            clip.asset.width / max(1, clip.asset.height),
+        )
+        self._load_crop_draft(
+            self._crop_edit_start_rect, self._crop_edit_start_preset,
+        )
+
+    def _load_crop_draft(
+        self,
+        rect: tuple[float, float, float, float] | None,
+        preset: str,
+    ) -> None:
+        """Push committed values into the overlay and the preset selector."""
+        if preset not in CROP_ASPECT_PRESETS:
+            preset = FREE_PRESET
+        self.crop_aspect_combo.blockSignals(True)
+        self.crop_aspect_combo.setCurrentText(preset)
+        self.crop_aspect_combo.blockSignals(False)
+        self.crop_overlay.set_aspect_ratio_preset(
+            CROP_ASPECT_PRESETS.get(preset), preset,
+        )
+        self.crop_overlay.set_normalized_rect(
+            QRectF(0.0, 0.0, 1.0, 1.0) if rect is None else QRectF(*rect),
+        )
+
+    def _crop_draft_commit_values(
+        self,
+    ) -> tuple[tuple[float, float, float, float] | None, str]:
+        """The draft as committed model values.
+
+        A full-frame draft canonicalizes to ``(None, Free)``: that is what
+        "no crop" means in the committed model, and storing ``(0,0,1,1)``
+        would make an uncropped clip look cropped to every consumer.
+        """
+        r = self.crop_overlay.normalized_rect()
+        if r == QRectF(0.0, 0.0, 1.0, 1.0):
+            return None, FREE_PRESET
+        preset = self.crop_overlay.preset_name()
+        if preset not in CROP_ASPECT_PRESETS:
+            preset = FREE_PRESET
+        return (r.x(), r.y(), r.width(), r.height()), preset
+
+    def _finish_crop_edit(self, *, commit: bool) -> None:
+        """Close an open crop session, applying or discarding the draft.
+
+        Confirm resolves the *session owner id*, never the current
+        selection: the timeline updates its selection before it emits, so
+        asking "what is selected now?" here would write one clip's draft
+        into another.
+        """
+        if not self._crop_edit_clip_id:
+            return
+        owner = self._crop_edit_owner()
+        if commit and owner is not None:
+            rect, preset = self._crop_draft_commit_values()
+            if (owner.crop_rect, owner.crop_preset) != (rect, preset):
+                self._snapshot()
+                owner.crop_rect = rect
+                owner.crop_preset = preset
+        else:
+            # Cancel wrote nothing, so there is nothing to roll back in the
+            # model; only the overlay needs putting back.
+            self._load_crop_draft(
+                self._crop_edit_start_rect, self._crop_edit_start_preset,
+            )
+        self._crop_edit_clip_id = ""
+        self._crop_edit_start_rect = None
+        self._crop_edit_start_preset = FREE_PRESET
+        self._uncheck_crop_button()
+        self._set_crop_editing_visible(False)
+        self._update_crop_button_status()
+
+    def _on_crop_confirm_clicked(self) -> None:
+        self._finish_crop_edit(commit=True)
+
+    def _update_crop_button_status(self) -> None:
+        """Show the *selected* clip's committed crop on the Crop button.
+
+        Never the last edited clip, the live overlay, or the preview: the
+        button answers "does this clip have a crop?" and nothing else.
+        """
+        c = self._selected_clip()
+        if c is None or c.crop_rect is None:
+            self.crop_btn.setText("Crop")
+            return
+        self.crop_btn.setText(f"Crop ({compact_preset_label(c.crop_preset)})")
 
     def _sync_crop_overlay_aspect(self) -> None:
-        """Point the overlay at the selected clip's source aspect, if any."""
-        c = self._selected_clip()
+        """Point the overlay at the edited clip's source aspect, if any."""
+        c = self._crop_edit_owner() or self._selected_clip()
         if c is not None:
             self.crop_overlay.set_video_aspect(c.asset.width / max(1, c.asset.height))
 
@@ -3708,6 +3937,11 @@ class MainWindow(QMainWindow):
         ]
 
     def _on_export_clicked(self) -> None:
+        # Export what the user can see. An open crop draft is committed
+        # before anything else so the job is built from `Clip.crop_rect`;
+        # closing crop mode here also stops `_crop_pixels()` handing the
+        # exporter a stale selection-scoped global crop.
+        self._finish_crop_edit(commit=True)
         fmt_key = self.format_combo.currentText()
         spec = ff.EXPORT_FORMATS[fmt_key]
         is_audio_only = spec["vcodec"] is None
@@ -3866,6 +4100,7 @@ class MainWindow(QMainWindow):
         self.encoder_combo.setEnabled(visual_enabled)
         self.encoder_lbl.setEnabled(visual_enabled)
         self.crop_btn.setEnabled(loaded)
+        self._update_crop_button_status()
         self.format_combo.setEnabled(can_export)
         self.export_btn.setEnabled(can_export)
         for w in (self.split_btn, self.delete_clip_btn):
