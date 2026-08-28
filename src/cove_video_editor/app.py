@@ -88,6 +88,7 @@ from . import __version__
 from . import ffmpeg_utils as ff
 from . import theme
 from . import updater
+from .system_open import open_local as _open_local
 from .system_open import open_url as _open_url
 from .titlebar import TitleBar, FramelessResizer
 from .clip import (
@@ -1020,6 +1021,10 @@ class MainWindow(QMainWindow):
         self._added_wave_workers: dict[str, object] = {}
         self._export_thread: QThread | None = None
         self._export_worker = None
+        # Output of the most recent *successful* export, and nothing else -
+        # the only thing "Show in folder" needs. Cleared when a new export
+        # starts so the action can never point at a previous run's file.
+        self._last_export_output: Path | None = None
         self._download_dialog: DownloadVideoDialog | None = None
         # List of added-audio clips on the mix track; each has its own player.
         self._added_audios: list[AddedAudio] = []
@@ -1772,6 +1777,15 @@ class MainWindow(QMainWindow):
         self._last_progress = 0
         self._last_eta: float | None = None
         bottom.addWidget(self.progress, stretch=1)
+
+        # Success-only affordance. Hidden until an export completes, so it
+        # costs the (already dense) export row nothing the rest of the time.
+        self.show_folder_btn = QPushButton("Show in folder")
+        self.show_folder_btn.setObjectName("FlatButton")
+        self.show_folder_btn.setFixedHeight(28)
+        self.show_folder_btn.setVisible(False)
+        self.show_folder_btn.clicked.connect(self._on_show_in_folder)
+        bottom.addWidget(self.show_folder_btn)
 
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
@@ -4232,6 +4246,10 @@ class MainWindow(QMainWindow):
             encoder_pref=self._selected_encoder_pref(),
         )
 
+        # A new attempt invalidates the previous one's reveal target, even
+        # if this attempt goes on to fail or be cancelled.
+        self._set_last_export_output(None)
+
         self._last_progress = 0
         self._last_eta = None
         self.progress.setValue(0)
@@ -4308,6 +4326,39 @@ class MainWindow(QMainWindow):
         self._last_eta = None
         self.progress.setValue(100)
         self.progress.setFormat("%p%")
+        # Only now, with the export accepted as successful, does the output
+        # become a legitimate reveal target.
+        self._set_last_export_output(out)
+
+    def _set_last_export_output(self, out: Path | None) -> None:
+        self._last_export_output = out
+        self.show_folder_btn.setVisible(out is not None)
+
+    def _on_show_in_folder(self) -> None:
+        """Open the directory that received the last successful export.
+
+        The file itself may have been moved or deleted since - the folder
+        is still the useful destination, so its existence is never
+        required. Neither failure below is an *export* problem, so both
+        stay in the status bar and the log: no modal, and the action stays
+        armed so the user can simply try again.
+        """
+        out = self._last_export_output
+        if out is None:
+            return
+        folder = out.parent
+        if not folder.is_dir():
+            self._report_reveal_problem("Export folder is no longer available")
+            return
+        try:
+            _open_local(str(folder))
+        except OSError as exc:
+            self._report_reveal_problem(f"Could not open export folder: {exc}",
+                                        status="Could not open export folder")
+
+    def _report_reveal_problem(self, detail: str, status: str = "") -> None:
+        self.status.showMessage(status or detail, 8000)
+        self.export_log.append(detail)
 
     def _on_export_failed(self, msg: str) -> None:
         # First line as short status; full detail goes to the log panel.
