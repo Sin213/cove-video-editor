@@ -4247,6 +4247,7 @@ class MainWindow(QMainWindow):
         worker.log.connect(self._on_worker_log, Qt.QueuedConnection)
         worker.finished.connect(self._on_export_done, Qt.QueuedConnection)
         worker.failed.connect(self._on_export_failed, Qt.QueuedConnection)
+        worker.cancelled.connect(self._on_export_cancelled, Qt.QueuedConnection)
         thread.finished.connect(self._reset_after_export)
         self._export_thread = thread
         self._export_worker = worker
@@ -4289,11 +4290,18 @@ class MainWindow(QMainWindow):
             self.progress.setFormat(f"%p%  •  ETA {m}:{s:02d}")
 
     def _on_export_done(self, out: Path) -> None:
-        size_b = out.stat().st_size
-        size, unit = (size_b / 1024, "KB")
-        if size >= 1024:
-            size, unit = (size / 1024, "MB")
-        summary = f"Saved {out.name} ({size:.1f} {unit})"
+        # The encode succeeded, so the export is done either way; only the
+        # size is in doubt if the file vanished between ffmpeg finishing
+        # and this slot running. Never invent a size, never crash the slot.
+        try:
+            size_b = out.stat().st_size
+        except OSError:
+            summary = f"Saved {out.name} (size unavailable)"
+        else:
+            size, unit = (size_b / 1024, "KB")
+            if size >= 1024:
+                size, unit = (size / 1024, "MB")
+            summary = f"Saved {out.name} ({size:.1f} {unit})"
         self.status.showMessage(summary, 8000)
         self.export_log.append(f"✓ {summary}")
         self._last_progress = 100
@@ -4314,6 +4322,19 @@ class MainWindow(QMainWindow):
             self, "Export failed",
             f"{short}\n\nSee Details for the full ffmpeg log.",
         )
+
+    def _on_export_cancelled(self) -> None:
+        """The user stopped the export. Routine, so say so quietly.
+
+        No red marker, no modal, and Details is left exactly as the user
+        set it - there is nothing to go and read. The control reset is the
+        shared `thread.finished -> _reset_after_export` path, same as a
+        completed or failed export.
+        """
+        self.status.showMessage("Export cancelled", 8000)
+        self.export_log.append("Export cancelled")
+        self._last_eta = None
+        self._refresh_progress_text()
 
     def _reset_after_export(self) -> None:
         self._export_thread = None

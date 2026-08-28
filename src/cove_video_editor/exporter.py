@@ -80,6 +80,10 @@ class ExportWorker(QObject):
     log = Signal(str)
     finished = Signal(Path)
     failed = Signal(str)
+    #: The user stopped the export. A deliberate stop is not a failure, so
+    #: it gets its own terminal outcome rather than a `failed("Cancelled")`.
+    #: Exactly one of finished/cancelled/failed is emitted per run.
+    cancelled = Signal()
 
     def __init__(self, job: ExportJob) -> None:
         super().__init__()
@@ -89,11 +93,49 @@ class ExportWorker(QObject):
         self._started_wall: float = 0.0
         self._eta_smoothed: float | None = None
         self._tmp_dir: Path | None = None
+        # A cancel *request* and a cancel that actually decided this run's
+        # outcome are different things, and conflating them lets a click
+        # that arrives after ffmpeg already died relabel a real failure as
+        # a cancellation. `_cancelled` records the request; `_cancel_claimed`
+        # records that cancellation got there first and owns the result.
+        self._cancel_claimed = False
+        self._encode_ok = False
+        # `Popen` spawns the child before it returns, so there is an
+        # interval where a real process exists and `_proc` is still None.
+        # Reading "no process object" as "no process" during that window
+        # would let a cancel claim a run whose child had already failed.
+        # The lock makes the four states a cancel can observe explicit:
+        # not started, starting, live, already terminal.
+        self._proc_lock = threading.Lock()
+        self._proc_starting = False
+        self._cancel_awaiting_publication = False
 
     def cancel(self) -> None:
         self._cancelled = True
-        if self._proc and self._proc.poll() is None:
-            self._proc.terminate()
+        with self._proc_lock:
+            proc = self._proc
+            if proc is None:
+                if self._proc_starting:
+                    # A child may already exist but we cannot poll it yet.
+                    # Defer ownership to publication rather than guess.
+                    self._cancel_awaiting_publication = True
+                else:
+                    # Genuinely nothing started, so nothing can have
+                    # finished either: the cancellation is first.
+                    self._cancel_claimed = True
+                return
+            self._claim_if_live(proc)
+
+    def _claim_if_live(self, proc: subprocess.Popen) -> None:
+        """Take ownership of the run only if the child is still running.
+
+        Callers hold ``_proc_lock``. A child that already reached its own
+        terminal status keeps it: a nonzero exit stays a failure and a
+        clean exit stays a success, however late the click arrives.
+        """
+        if proc.poll() is None:
+            self._cancel_claimed = True
+            proc.terminate()
 
     def run(self) -> None:
         self._started_wall = time.monotonic()
@@ -102,20 +144,37 @@ class ExportWorker(QObject):
             try:
                 cmd = self._build_command()
             except Exception as exc:  # noqa: BLE001
-                self.failed.emit(str(exc))
+                self._emit_abnormal(exc)
                 return
             self.log.emit("$ " + " ".join(cmd))
             try:
                 self._execute(cmd)
             except Exception as exc:  # noqa: BLE001
-                self.failed.emit(str(exc))
+                self._emit_abnormal(exc)
                 return
             finally:
                 self._tmp_dir = None
-        if self._cancelled:
-            self.failed.emit("Cancelled")
+        # A cancel that arrives after ffmpeg already exited 0 has nothing
+        # left to cancel: the export is on disk and complete.
+        if self._cancel_claimed and not self._encode_ok:
+            self.cancelled.emit()
             return
         self.finished.emit(self._job.output)
+
+    def _emit_abnormal(self, exc: Exception) -> None:
+        """Terminal outcome for a run that did not reach a normal end.
+
+        Killing the child can make whatever ran next raise, so an
+        exception on a run that cancellation already claimed is a
+        consequence of the user's stop, not a separate defect. Every
+        other exception is a real failure and keeps the failure channel
+        to itself - including one raised because ffmpeg exited nonzero on
+        its own, which stays a failure however late the cancel arrives.
+        """
+        if self._cancel_claimed:
+            self.cancelled.emit()
+        else:
+            self.failed.emit(str(exc))
 
     def _resolve_subtitle_path(self, sub: SubtitleTrack, tgt_w: int, tgt_h: int) -> Path:
         """Return the path ffmpeg's ``subtitles=`` filter should load.
@@ -444,15 +503,42 @@ class ExportWorker(QObject):
             total = max(0.01, job.region_end - job.region_start)
         else:
             total = max(0.01, job.total_timeline)
-        self._proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL,
-            text=True,
-            bufsize=1,
-            **_POPEN_KWARGS,
-        )
+        with self._proc_lock:
+            if self._cancel_claimed:
+                # Cancelled before startup: nothing to launch, and the
+                # outcome is already decided.
+                return
+            self._proc_starting = True
+
+        # Deliberately outside the lock: `Popen` can block, and a Cancel
+        # click must never wait on it. `_proc_starting` is what keeps the
+        # window honest while we are in here.
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+                **_POPEN_KWARGS,
+            )
+        except BaseException:
+            with self._proc_lock:
+                self._proc_starting = False
+                if self._cancel_awaiting_publication:
+                    # No child was ever produced, so the deferred cancel
+                    # owns the run after all.
+                    self._cancel_claimed = True
+            raise
+
+        with self._proc_lock:
+            self._proc = proc
+            self._proc_starting = False
+            if self._cancel_awaiting_publication:
+                self._cancel_awaiting_publication = False
+                self._claim_if_live(proc)
+
         assert self._proc.stdout is not None
         assert self._proc.stderr is not None
 
@@ -470,7 +556,13 @@ class ExportWorker(QObject):
 
         for line in self._proc.stdout:
             if self._cancelled:
-                self._proc.terminate()
+                # Just stop reading. Terminating belongs to whoever took
+                # ownership: either the cancel claimed a live child and
+                # already signalled it, or it did not claim - in which
+                # case the child is terminal and must keep its status.
+                # Re-terminating here would be redundant at best, and
+                # deciding ownership here would relabel a genuine failure
+                # as a cancellation.
                 break
             line = line.strip()
             if not line:
@@ -486,8 +578,13 @@ class ExportWorker(QObject):
                 break
 
         rc = self._proc.wait()
+        self._encode_ok = rc == 0
         stderr_thread.join(timeout=5)
-        if rc != 0 and not self._cancelled:
+        # A nonzero status is only ours to explain away if cancellation
+        # actually claimed this run. `_cancel_claimed` can no longer turn
+        # true once the child is dead, so a cancel arriving during the
+        # join above cannot convert a genuine failure into a cancellation.
+        if rc != 0 and not self._cancel_claimed:
             err = "\n".join(stderr_lines).strip()
             raise RuntimeError(f"ffmpeg exited {rc}: {err[-600:]}")
 
@@ -802,4 +899,7 @@ def start_export(job: ExportJob) -> tuple[QThread, ExportWorker]:
     thread.started.connect(worker.run)
     worker.finished.connect(thread.quit)
     worker.failed.connect(thread.quit)
+    # Cancellation is a terminal outcome too: without this the thread never
+    # finishes and `thread.finished -> _reset_after_export` never runs.
+    worker.cancelled.connect(thread.quit)
     return thread, worker
