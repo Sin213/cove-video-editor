@@ -124,3 +124,7 @@ jobs:
         with:
           files: release/*
           fail_on_unmatched_files: true
+          # Land as a draft so the release notes can be written and the
+          # assets checked before anything is announced. Publishing is a
+          # deliberate click, not a side effect of pushing a tag.
+          draft: true
