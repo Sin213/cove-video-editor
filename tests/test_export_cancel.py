@@ -159,6 +159,12 @@ def _job(out: Path, **kw) -> ExportJob:
 PROGRESS = ["out_time_us=1000000", "out_time_us=2000000", "progress=end"]
 
 
+#: What the fake child leaves on disk. A real ffmpeg writes its output
+#: file, and the worker promotes that file onto the destination, so a
+#: fake that produced nothing would model a failure production never sees.
+ENCODED = b"ENCODED"
+
+
 def _run(worker: ExportWorker, proc: FakeProc | None = None,
          popen_exc: BaseException | None = None):
     """Run the worker with the *export* ffmpeg replaced by ``proc``.
@@ -168,6 +174,9 @@ def _run(worker: ExportWorker, proc: FakeProc | None = None,
     too would fail them in a way production never sees, so anything that
     is not the ``-progress pipe:1`` export command goes to the real
     ``Popen``.
+
+    The fake writes ``ENCODED`` to whichever path the command names -
+    which, since the destination-ownership slice, is the run's own temp.
     """
     real_popen = exporter_mod.subprocess.Popen
 
@@ -176,6 +185,7 @@ def _run(worker: ExportWorker, proc: FakeProc | None = None,
             return real_popen(cmd, *a, **kw)
         if popen_exc is not None:
             raise popen_exc
+        Path(cmd[-1]).write_bytes(ENCODED)
         return proc
 
     with unittest.mock.patch.object(
@@ -369,7 +379,9 @@ class StartupPublicationRaceTests(_TempOut):
             if not (isinstance(cmd, list) and "-progress" in cmd):
                 return real_popen(cmd, *a, **kw)
             # The child now exists as far as the OS is concerned, but the
-            # worker has no handle on it yet.
+            # worker has no handle on it yet. It has already produced its
+            # output file, as a real ffmpeg would have.
+            Path(cmd[-1]).write_bytes(ENCODED)
             entered.set()
             self.assertTrue(release.wait(5), "test seam was never released")
             return proc
@@ -448,7 +460,7 @@ class StartupPublicationRaceTests(_TempOut):
 
 
 class OutputFileTests(_TempOut):
-    """Tab 2K deliberately does not delete anything at ``job.output``.
+    """Cancellation and failure never delete anything at ``job.output``.
 
     An earlier revision removed the partial file on cancellation. Without
     a run-owned output path there is no way to prove that whatever sits
@@ -456,13 +468,17 @@ class OutputFileTests(_TempOut):
     wrote - another process can create or replace it in between - so the
     deletion was dropped rather than replaced with a second heuristic.
     Deleting a file we do not own is worse than leaving a partial behind.
-    Safe cleanup is deferred to the "safe export destination ownership"
-    slice (run-owned temporary output plus atomic promotion).
+
+    The destination-ownership slice kept that rule and removed the reason
+    it cost anything: ffmpeg now writes to a run-owned temp, so there is
+    a partial to clean up that Cove provably owns. These tests stay as
+    they are - they pin the half that must never change, that nothing but
+    a successful promotion may write to the user's chosen path.
     """
 
-    def test_cancellation_leaves_the_partial_destination_in_place(self) -> None:
-        """The deferred limitation, pinned so it cannot regress silently
-        in either direction."""
+    def test_cancellation_leaves_a_foreign_destination_in_place(self) -> None:
+        """A file appears at the destination mid-export - from another
+        tool, or another Cove run. Cancelling must not remove it."""
         def _write_partial() -> None:
             self.out.write_bytes(b"\x00" * 4096)
 
@@ -493,15 +509,21 @@ class OutputFileTests(_TempOut):
         self.assertEqual(seen.order, ["cancelled"])
         self.assertFalse(self.out.exists())
 
-    def test_successful_output_is_never_deleted(self) -> None:
+    def test_successful_output_replaces_what_was_there(self) -> None:
+        """A success is the one outcome allowed to touch the destination.
+
+        Tab 2K asserted the old file survived a success, because nothing
+        was ever moved onto it. The destination-ownership slice made the
+        promotion real, so a completed export now lands where the user
+        asked for it - and only then.
+        """
         self.out.write_bytes(b"\x00" * 2048)
         worker = ExportWorker(_job(self.out))
         seen = Outcomes(worker)
         _run(worker, FakeProc(PROGRESS, rc=0))
 
         self.assertEqual(seen.order, ["finished"])
-        self.assertTrue(self.out.exists())
-        self.assertEqual(self.out.stat().st_size, 2048)
+        self.assertEqual(self.out.read_bytes(), ENCODED)
 
     def test_a_cancel_that_loses_the_race_still_reports_success(self) -> None:
         """Clicking Cancel at the exact moment ffmpeg exits 0.
@@ -517,8 +539,7 @@ class OutputFileTests(_TempOut):
         _run(worker, proc)
 
         self.assertEqual(seen.order, ["finished"])
-        self.assertTrue(self.out.exists())
-        self.assertEqual(self.out.stat().st_size, 4096)
+        self.assertEqual(self.out.read_bytes(), ENCODED)
 
     def test_failed_output_is_left_alone(self) -> None:
         """Failure keeps its existing semantics."""

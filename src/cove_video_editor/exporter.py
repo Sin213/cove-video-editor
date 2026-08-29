@@ -3,10 +3,12 @@ from __future__ import annotations
 import collections
 import os
 import re
+import stat
 import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -20,7 +22,13 @@ from .clip import Clip, SubtitleTrack, sequence_length, sort_clips
 from .ffmpeg_utils import build_export_video_encoder_args  # noqa: F401
 
 
-if os.name == "nt":
+#: Resolved once, and named, so the places that need to branch on the
+#: platform read as intent rather than as a string comparison - and so a
+#: test can drive the other platform's branch without patching `os.name`
+#: out from under `tempfile` and `pathlib` for the whole run.
+_IS_WINDOWS = os.name == "nt"
+
+if _IS_WINDOWS:
     _CREATE_NO_WINDOW = 0x08000000
     _POPEN_KWARGS: dict = {"creationflags": _CREATE_NO_WINDOW}
 else:
@@ -28,6 +36,241 @@ else:
 
 
 _FILTER_LABEL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+#: Infix that makes a temporary export recognizable as Cove's own, so a
+#: leftover from a crashed run can be identified rather than guessed at.
+TEMP_MARKER = "cove-export"
+
+#: Fallback for the bytes a single path component may occupy. 255 is the
+#: limit on every filesystem Cove ships against (ext4, btrfs, XFS, APFS,
+#: NTFS, exFAT), and is only used when the real limit cannot be read. The
+#: decoration below costs ~26 bytes, so without bounding the stem a
+#: destination name that is itself perfectly valid would become
+#: unexportable with ENAMETOOLONG.
+_NAME_MAX = 255
+
+
+def _name_max(directory: Path) -> int:
+    """The component-length limit that actually applies to ``directory``.
+
+    The constraint belongs to the filesystem holding the destination, not
+    to a constant: a mount with a smaller limit would accept the name the
+    user chose and then reject the decorated temp beside it. Where the
+    real limit cannot be had - `pathconf` does not exist on Windows, and
+    can fail anywhere - the portable floor is the safer answer, since
+    refusing to export is worse than a name that is merely shorter than
+    it needed to be.
+    """
+    try:
+        limit = os.pathconf(directory, "PC_NAME_MAX")
+    except (OSError, ValueError, AttributeError):
+        return _NAME_MAX
+    return limit if limit and limit > 0 else _NAME_MAX
+
+
+def owned_temp_output(final: Path) -> Path:
+    """Return the temporary output path a single export run owns.
+
+    The file lives beside the requested destination so promotion can be a
+    same-filesystem ``os.replace`` - moving it through a system temp
+    directory would risk a cross-device rename and turn the one atomic
+    step into a copy. It keeps the destination's suffix because ffmpeg
+    infers the muxer from it, and it is prefixed with a dot so an
+    in-progress export does not clutter the user's folder.
+
+    The token is random rather than derived from a counter or the pid:
+    two Cove processes exporting to the same destination must not be able
+    to agree on a name, since cleanup deletes this path unconditionally
+    and would otherwise remove another run's work in progress.
+
+    The decorated name is bounded to the filesystem's component limit in
+    priority order. The marker and token never give way - they are what
+    makes the file identifiable and unique. The suffix gives way only if
+    it alone would break the limit, which no suffix ffmpeg could infer a
+    muxer from ever does. The stem gives way first, since it is there for
+    the user's benefit rather than the encoder's. Truncation is on the
+    encoded bytes, because that is what the limit counts, and
+    ``errors="ignore"`` drops a multi-byte character split by the cut
+    rather than emitting a lone surrogate.
+
+    The suffix is split the way *ffmpeg* reads a filename - everything
+    after the last dot - not the way POSIX does. The two disagree on
+    leading-dot names: ``Path(".mp4").suffix`` is empty because POSIX
+    calls that a hidden file named "mp4", while ffmpeg happily infers the
+    MP4 muxer from it. Using the POSIX reading would hand ffmpeg a temp
+    with no extension at all and lose the container the user chose.
+    """
+    core = f".{TEMP_MARKER}-{uuid.uuid4().hex[:12]}"
+    budget = max(0, _name_max(final.parent) - len(core.encode()) - len(b"."))
+    name = final.name
+    dot = name.rfind(".")
+    raw_stem, raw_suffix = (name[:dot], name[dot:]) if dot >= 0 else (name, "")
+    suffix = raw_suffix.encode()[:budget].decode(errors="ignore")
+    stem = raw_stem.encode()[:budget - len(suffix.encode())].decode(errors="ignore")
+    return final.parent / f".{stem}{core}{suffix}"
+
+
+def _resolve_destination(final: Path) -> Path:
+    """Return the file the export's bytes should actually land in.
+
+    Only a genuine symlink is followed. Resolving every path would be
+    gratuitous - it would rewrite the directory the temp lives in and the
+    folder the UI reveals, for destinations that were never indirect.
+
+    A link that cannot be resolved (a loop, or a permission problem on
+    the way) is left alone rather than guessed at; the promotion will
+    then fail against the literal path with the destination untouched,
+    which is the safe direction.
+    """
+    if not final.is_symlink():
+        return final
+    try:
+        return final.resolve()
+    except OSError:
+        return final
+
+
+def _carry_posix_metadata(source: Path, onto: Path) -> None:
+    """Copy an existing destination's access controls onto the encode.
+
+    ``source`` is the file about to be replaced and ``onto`` is the file
+    that will take its place. A destination that does not exist yet has
+    nothing to hand over, which is the only condition treated as normal
+    here; every other error propagates so the caller can abandon the
+    promotion with the original still in place.
+
+    The mode goes on first and the extended attributes second, matching
+    the order ``shutil.copystat`` uses. The two interact - ``chmod``
+    rewrites a POSIX ACL's mask entry, and applying the ACL rewrites the
+    group permission bits - but not here: both values are read from the
+    same file, so they already agree and either order lands in the same
+    place. The order is kept for the reader's benefit and to stay
+    correct if the two ever stop coming from one source.
+
+    Every attribute is copied rather than a chosen subset: which ones
+    carry access-control meaning is a policy of the filesystem and the
+    host, not something this function is in a position to judge.
+    """
+    try:
+        st = os.stat(source)
+    except FileNotFoundError:
+        return
+    # Ownership is an access control too: an in-place truncate kept the
+    # replaced file's uid/gid, and a rename hands the file to whoever ran
+    # the export. Only attempted when it would actually change something,
+    # so the ordinary case of re-exporting your own file cannot acquire a
+    # new way to fail - and the case that *would* silently transfer a
+    # file to a different owner is the one that stops the promotion.
+    onto_st = os.stat(onto)
+    if (st.st_uid, st.st_gid) != (onto_st.st_uid, onto_st.st_gid):
+        os.chown(onto, st.st_uid, st.st_gid)
+    os.chmod(onto, st.st_mode & 0o7777)
+
+    # The encode's attributes are reconciled *to* the destination's, not
+    # merely topped up from them. A directory carrying a default ACL
+    # grants named entries to every file created in it, so the temp can
+    # arrive holding permissions the destination never had; leaving those
+    # in place would let a re-export widen access rather than reproduce
+    # it. Anything the destination does not have is removed.
+    wanted = {name: os.getxattr(source, name) for name in os.listxattr(source)}
+    for name in os.listxattr(onto):
+        if name not in wanted:
+            os.removexattr(onto, name)
+    for name, value in wanted.items():
+        # Writing an attribute that already holds the right value is a
+        # privileged operation performed for no reason, and some
+        # attributes are readable but not writable - which would fail an
+        # export that has nothing wrong with it.
+        try:
+            if os.getxattr(onto, name) == value:
+                continue
+        except OSError:
+            pass
+        os.setxattr(onto, name, value)
+
+
+def _restore_replaced_file(backup: Path, final: Path) -> None:
+    """Put ``backup`` back at ``final``, refusing to overwrite anything.
+
+    Recovery runs because a replacement failed, so it must not become a
+    second way to destroy something: a file created at the destination
+    between the check and the move is one this export never nominated,
+    and it has to survive. The move therefore has to refuse rather than
+    clobber, which rules out ``os.replace``.
+
+    Two platforms, one guarantee. On Windows ``os.rename`` already means
+    "fail if the target exists", which is the primitive this path runs on
+    in production. Elsewhere the same guarantee comes from an atomic hard
+    link followed by dropping the old name. The branch is on the real
+    platform rather than on the promotion-policy flag, because what
+    differs here is which primitive the operating system actually offers.
+    """
+    if os.name == "nt":
+        os.rename(backup, final)
+        return
+    os.link(backup, final)
+    os.unlink(backup)
+
+
+def _file_identity(path: Path) -> tuple[int, int]:
+    """Identify the filesystem object at ``path``, without following it.
+
+    A pathname is not an identity: the entry it names can be swapped for
+    another file at any moment. This is what lets the code tell a file it
+    created from one that merely occupies the same name. A path that is
+    not an ordinary file has no identity worth recording, since nothing
+    here should ever be acting on a link or a device node.
+    """
+    st = os.lstat(path)
+    if not stat.S_ISREG(st.st_mode):
+        raise OSError(f"{path.name} is not a regular file")
+    return (st.st_dev, st.st_ino)
+
+
+def _replace_file_win32(replaced: Path, replacement: Path, backup: Path) -> None:
+    """Replace ``replaced`` with ``replacement`` via ``ReplaceFileW``.
+
+    Windows has no POSIX-style metadata to copy by hand; the access
+    control state lives in a security descriptor that a rename does not
+    move. ``MoveFileEx`` - which is what ``os.replace`` becomes here -
+    therefore leaves the new file inheriting the directory's permissions
+    rather than keeping the replaced file's DACL.
+
+    ``ReplaceFileW`` is the API Windows provides for exactly this
+    situation. It performs the substitution and transfers the replaced
+    file's attributes to the replacement, so the result keeps the access
+    controls, named streams and creation time the destination had.
+
+    ``backup`` is mandatory, not a convenience. Windows documents
+    ERROR_UNABLE_TO_MOVE_REPLACEMENT as leaving the replaced file
+    *deleted* when no backup name was given - a promotion that can
+    destroy the destination is the one outcome this whole boundary exists
+    to rule out. With a backup name the replaced file always survives
+    somewhere, so the caller can put it back.
+
+    Reached through ``ctypes`` deliberately: it is in ``kernel32``, so no
+    third-party extension is needed to call it. ``ctypes.wintypes`` is
+    imported here rather than at module scope because it does not exist
+    on other platforms.
+    """
+    import ctypes
+    import ctypes.wintypes as wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    replace_file = kernel32.ReplaceFileW
+    replace_file.argtypes = [
+        wintypes.LPCWSTR,   # lpReplacedFileName
+        wintypes.LPCWSTR,   # lpReplacementFileName
+        wintypes.LPCWSTR,   # lpBackupFileName - none wanted
+        wintypes.DWORD,     # dwReplaceFlags
+        wintypes.LPVOID,    # lpExclude - reserved
+        wintypes.LPVOID,    # lpReserved
+    ]
+    replace_file.restype = wintypes.BOOL
+
+    if not replace_file(str(replaced), str(replacement), str(backup),
+                        0, None, None):
+        raise ctypes.WinError(ctypes.get_last_error())
 
 
 @dataclass
@@ -93,6 +336,27 @@ class ExportWorker(QObject):
         self._started_wall: float = 0.0
         self._eta_smoothed: float | None = None
         self._tmp_dir: Path | None = None
+        # Runtime-only ownership state. `job.output` keeps meaning "where
+        # the user asked for the export"; this is the only path ffmpeg is
+        # ever given, and the only path cleanup is ever allowed to delete.
+        # Allocated once here so a run has exactly one owned temp, and so
+        # no code path can encode before the name exists. Naming it does
+        # not create it - ffmpeg's `-y` does that when the encode starts.
+        #
+        # A symlinked destination is a path the user pointed somewhere
+        # else on purpose. ffmpeg wrote through it; renaming onto it
+        # would delete the link and drop a regular file in its place,
+        # leaving the real target stale. So the bytes are promoted onto
+        # the resolved target, and the temp sits beside *that* - which is
+        # also what keeps the rename on one filesystem. `job.output`
+        # stays the path the user chose, and is what `finished` reports.
+        self._promotion_target: Path = _resolve_destination(job.output)
+        self._temp_output: Path = owned_temp_output(self._promotion_target)
+        # Set when the temp path has been claimed atomically, to the
+        # identity of the file that claim created. An unguessable name is
+        # not the same as ownership: until this is set nothing at that
+        # path is ours to write over, promote, or delete.
+        self._temp_identity: tuple[int, int] | None = None
         # A cancel *request* and a cancel that actually decided this run's
         # outcome are different things, and conflating them lets a click
         # that arrives after ffmpeg already died relabel a real failure as
@@ -142,14 +406,19 @@ class ExportWorker(QObject):
         with tempfile.TemporaryDirectory(prefix="cove-subs-") as _tmp:
             self._tmp_dir = Path(_tmp)
             try:
-                cmd = self._build_command()
+                # ffmpeg is pointed at this run's own temp, never at the
+                # user's destination, so nothing can appear there until
+                # the encode has fully succeeded.
+                cmd = self._build_command(self._temp_output)
             except Exception as exc:  # noqa: BLE001
+                self._discard_temp()
                 self._emit_abnormal(exc)
                 return
             self.log.emit("$ " + " ".join(cmd))
             try:
                 self._execute(cmd)
             except Exception as exc:  # noqa: BLE001
+                self._discard_temp()
                 self._emit_abnormal(exc)
                 return
             finally:
@@ -157,9 +426,338 @@ class ExportWorker(QObject):
         # A cancel that arrives after ffmpeg already exited 0 has nothing
         # left to cancel: the export is on disk and complete.
         if self._cancel_claimed and not self._encode_ok:
+            self._discard_temp()
             self.cancelled.emit()
             return
+        self._promote()
+
+    def _promote(self) -> None:
+        """Move the finished encode onto the requested destination.
+
+        The single point at which an export becomes user-visible. Until
+        this returns, whatever was at ``job.output`` before is still
+        there, and ``finished`` is only emitted once the replacement has
+        actually happened - a zero exit status alone is not a completed
+        export.
+
+        ``os.replace`` is atomic on a same-filesystem move, which the
+        sibling temp guarantees, so the destination is never observed
+        half-written. There is deliberately no copy fallback: a copy would
+        reintroduce exactly the partial-destination window this slice
+        exists to close.
+
+        A promotion that fails leaves the encode where it is. It is real,
+        completed work and the only copy of it, so deleting it to tidy up
+        would destroy the one thing worth recovering.
+        """
+        try:
+            self._verify_encode()
+            self._verify_destination_binding()
+            self._replace_destination()
+        except OSError as exc:
+            self.failed.emit(self._promotion_failure_message(exc))
+            return
         self.finished.emit(self._job.output)
+
+    def _replace_destination(self) -> None:
+        """Put the encode at the destination, carrying its security state.
+
+        Replacing a file is not the same as overwriting one. ffmpeg used
+        to truncate the destination in place, so its inode survived and
+        with it every access control attached to it. A rename swaps in a
+        different file object, and anything bound to the old one - POSIX
+        ACLs and extended attributes, Windows DACLs and named streams -
+        goes with it unless it is carried across first.
+
+        Two platforms, two primitives, one boundary. On Windows
+        ``ReplaceFileW`` is the operation built for this and transfers
+        that state itself. On POSIX there is no such call, so the
+        metadata is applied to the encode before the rename.
+
+        Nothing is preserved when there is no destination yet, because
+        there is nothing to preserve: a first export is an ordinary
+        atomic rename on both platforms.
+
+        Every failure here happens *before* the replacement, so a
+        destination whose access controls could not be carried over is
+        left exactly as it was rather than replaced and reported after
+        the fact.
+        """
+        final, temp = self._promotion_target, self._temp_output
+        if _IS_WINDOWS:
+            if final.exists():
+                self._replace_win32_with_backup(final, temp)
+                return
+        else:
+            _carry_posix_metadata(final, temp)
+        os.replace(temp, final)
+
+    def _replace_win32_with_backup(self, final: Path, temp: Path) -> None:
+        """``ReplaceFileW`` with a backup, and a real recovery on failure.
+
+        Windows does not guarantee that a failed replacement rolls back.
+        With a backup name the replaced file always survives as either
+        itself or the backup, so a failure that already removed the
+        destination can be undone by moving the backup into its place.
+
+        The backup only exists for the length of this call. A successful
+        replacement leaves it holding the previous contents, which is
+        clutter in the user's folder rather than anything they asked for,
+        so it is removed - and failing to remove it does not un-succeed
+        an export that genuinely completed.
+        """
+        backup = owned_temp_output(final)
+        # ``ReplaceFileW`` moves the replaced file to the backup name, so
+        # the backup carries the destination's identity. Recording it now
+        # is what later distinguishes the file this operation set aside
+        # from anything else that might come to occupy that name.
+        try:
+            replaced_identity: tuple[int, int] | None = _file_identity(final)
+        except OSError:
+            replaced_identity = None
+        try:
+            _replace_file_win32(final, temp, backup)
+        except OSError:
+            self._recover_replaced_file(final, backup)
+            raise
+        self._discard_backup(final, backup, replaced_identity)
+
+    def _recover_replaced_file(self, final: Path, backup: Path) -> None:
+        """Put the destination back after a failed replacement.
+
+        Windows can fail having already removed the destination, leaving
+        it only in the backup. Moving the backup into place undoes that.
+
+        Once a backup exists after a failed replacement it is never
+        deleted here. Windows documents states in which the original
+        lives at the backup path, and a file sitting at the destination
+        is not proof that it is the original - another process may have
+        created it in the meantime. Since the code cannot tell those
+        apart, it keeps the backup and says where it is. Leaving a spare
+        copy behind is a cost; deleting the user's only one is not a
+        risk worth taking to avoid it.
+
+        The export still fails on its original error either way, so
+        nothing in here may raise: this runs while that error is being
+        propagated, and a second exception from a probe would replace the
+        real reason the export failed with an incidental one. Every check
+        is therefore guarded, and an answer that cannot be determined is
+        read the cautious way - assume there is a backup, assume the
+        destination is occupied, keep the file and say where it is.
+        """
+        try:
+            backup_present = backup.exists()
+        except OSError:
+            backup_present = True
+        if not backup_present:
+            return
+        try:
+            destination_present = final.exists()
+        except OSError:
+            destination_present = True
+        if not destination_present:
+            try:
+                _restore_replaced_file(backup, final)
+                return
+            except OSError as exc:
+                self.log.emit(
+                    f"{final.name} could not be put back after a failed "
+                    f"replacement ({exc}); the previous file is preserved "
+                    f"as {backup.name}"
+                )
+                return
+        self.log.emit(
+            f"the replacement of {final.name} failed; the file that was "
+            f"there beforehand is preserved as {backup.name}"
+        )
+
+    def _discard_backup(self, final: Path, backup: Path,
+                        replaced_identity: tuple[int, int] | None) -> None:
+        """Drop the backup once the destination is provably in place.
+
+        Only ever called after a successful replacement, so this can
+        never remove the last copy of anything. It still has to prove
+        *what* it is removing: the backup name is generated rather than
+        reserved, so the entry is only deleted when it is still the file
+        the replacement set aside. Anything else there belongs to
+        somebody else and is left alone, exactly as at the temp path.
+
+        Failing to remove it leaves clutter, which is not a reason to
+        un-succeed an export that genuinely completed.
+        """
+        try:
+            if replaced_identity is None or _file_identity(backup) != replaced_identity:
+                self.log.emit(
+                    f"{backup.name} is not the file that was replaced, so "
+                    f"it has been left in place"
+                )
+                return
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            self.log.emit(
+                f"could not check the temporary backup of "
+                f"{final.name}: {exc}"
+            )
+            return
+        try:
+            backup.unlink(missing_ok=True)
+        except OSError as exc:
+            self.log.emit(
+                f"could not remove the temporary backup of "
+                f"{final.name}: {exc}"
+            )
+
+    def _reserve_temp(self) -> None:
+        """Claim the temp path atomically, and remember what we claimed.
+
+        An unguessable name keeps two exports from colliding, but it does
+        not establish ownership: anything with write access to the folder
+        could occupy that path first, and a planted symlink would send
+        ffmpeg's ``-y`` somewhere else entirely. ``O_EXCL`` settles it -
+        the call succeeds only if it is the thing that created the file,
+        and refuses to follow a symlink - so from here on the path is
+        provably this run's.
+
+        Created with the ordinary permissive mode so the umask applies,
+        exactly as ffmpeg's own file creation would: reserving the name
+        must not quietly change what an export's permissions look like.
+
+        Called after the pre-start cancel check, so a run that never
+        begins still leaves nothing behind.
+        """
+        fd = os.open(self._temp_output,
+                     os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+        try:
+            st = os.fstat(fd)
+            # Recorded before the close, because the file is already ours
+            # by this point. Waiting until afterwards would mean a close
+            # that failed left a reserved file nothing could claim, and
+            # so nothing would ever clean up.
+            self._temp_identity = (st.st_dev, st.st_ino)
+        finally:
+            os.close(fd)
+
+    def _verify_destination_binding(self) -> None:
+        """Check the destination still means what it meant at the start.
+
+        A symlinked destination is resolved once, when the run begins,
+        and the encode is placed beside whatever it named then. If the
+        link is repointed while ffmpeg is working, that file is no longer
+        the one the user is asking for: overwriting it would destroy a
+        file nobody nominated, and reporting success would misstate where
+        the export went. Better to stop with both files intact and the
+        encode retained.
+        """
+        current = _resolve_destination(self._job.output)
+        if current != self._promotion_target:
+            raise OSError(
+                f"{self._job.output.name} no longer points at "
+                f"{self._promotion_target}, so the export was not moved "
+                f"into place"
+            )
+
+    def _verify_encode(self) -> None:
+        """Check the thing about to be promoted is the encode we made.
+
+        Between reserving the path and finishing the encode the file
+        could in principle have been swapped for something else. Since
+        the next step overwrites the user's destination with it, it is
+        worth confirming that it is still the same file, is still an
+        ordinary file rather than a link, and actually holds an encode -
+        a zero-byte output is ffmpeg reporting success while producing
+        nothing, and promoting that would replace a real video with an
+        empty file.
+        """
+        if self._temp_identity is None:
+            raise OSError("the export never reserved an output file")
+        st = os.lstat(self._temp_output)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(f"{self._temp_output.name} is no longer a regular file")
+        if (st.st_dev, st.st_ino) != self._temp_identity:
+            raise OSError(
+                f"{self._temp_output.name} was replaced by a different file "
+                f"while the export was running"
+            )
+        if st.st_size == 0:
+            raise OSError("ffmpeg reported success but produced no output")
+
+    def _promotion_failure_message(self, exc: OSError) -> str:
+        """Explain a failed promotion, and only promise what is there.
+
+        The encode usually survives a promotion failure and is worth
+        pointing at. It does not always: a zero exit with no output file
+        lands here too, and sending the user after a file that does not
+        exist wastes their time at the least helpful moment.
+        """
+        msg = f"the export finished but could not be moved into place: {exc}"
+        # Only worth pointing at if there is a real encode there. An
+        # empty reservation is nothing to recover.
+        #
+        # One guarded lookup, and any problem with it simply means no
+        # recovery sentence. Explaining a failure must never become a
+        # second way to fail: an exception raised here would escape
+        # before `failed` was emitted and leave the run with no terminal
+        # outcome at all.
+        try:
+            retained = self._temp_output.stat().st_size > 0
+        except OSError:
+            retained = False
+        if retained:
+            # The temp sits beside the *resolved* destination, which is
+            # not `job.output`'s folder when that path is a symlink.
+            msg += (f". The encoded file is still in "
+                    f"{self._temp_output.parent} as {self._temp_output.name}")
+        return msg
+
+    def _discard_temp(self) -> None:
+        """Drop this run's own temporary output, and nothing else.
+
+        The path is one this run invented, so deleting it cannot destroy
+        anything the user or another export owns - which is the whole
+        reason the temp exists. ``job.output`` is never a candidate here.
+
+        Failing to tidy up is not itself a terminal outcome: a user who
+        cancelled still cancelled, and an encode that failed still failed
+        for its own reason. So the problem is reported through the export
+        log, which is already on screen, and swallowed otherwise.
+
+        Without a reservation there is nothing of ours at that path, and
+        whatever is there belongs to somebody else - deleting it would be
+        the exact mistake the owned temp exists to avoid.
+
+        Having reserved it once is not enough either. Promotion proves
+        the file is still the one this run created before overwriting the
+        destination with it; deleting a file is just as irreversible, so
+        it proves the same thing first. Anything else at that path is
+        somebody else's, and is left alone and reported.
+        """
+        if self._temp_identity is None:
+            return
+        try:
+            st = os.lstat(self._temp_output)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            self.log.emit(
+                f"could not check the temporary export file "
+                f"{self._temp_output.name}: {exc}"
+            )
+            return
+        if (not stat.S_ISREG(st.st_mode)
+                or (st.st_dev, st.st_ino) != self._temp_identity):
+            self.log.emit(
+                f"{self._temp_output.name} is no longer the file this "
+                f"export created, so it has been left alone"
+            )
+            return
+        try:
+            self._temp_output.unlink(missing_ok=True)
+        except OSError as exc:
+            self.log.emit(
+                f"could not remove the temporary export file "
+                f"{self._temp_output.name}: {exc}"
+            )
 
     def _emit_abnormal(self, exc: Exception) -> None:
         """Terminal outcome for a run that did not reach a normal end.
@@ -197,7 +795,14 @@ class ExportWorker(QObject):
 
     # --- build --------------------------------------------------------
 
-    def _build_command(self) -> list[str]:
+    def _build_command(self, output: Path | None = None) -> list[str]:
+        """Build the ffmpeg command for this job, writing to ``output``.
+
+        Every argument except the destination is a function of the job
+        alone. ``run`` always passes the run-owned temp; leaving it unset
+        yields the command for the job's requested destination, which is
+        what the command-shape tests inspect.
+        """
         job = self._job
         clips = sort_clips(job.clips)
         spec = ff.EXPORT_FORMATS.get(job.fmt_key)
@@ -279,7 +884,7 @@ class ExportWorker(QObject):
             if spec["acodec"] == "aac":
                 cmd += ["-b:a", "192k"]
         cmd += list(spec.get("extra", []))
-        cmd.append(str(job.output))
+        cmd.append(str(job.output if output is None else output))
         return cmd
 
     def _build_filtergraph(
@@ -513,7 +1118,14 @@ class ExportWorker(QObject):
         # Deliberately outside the lock: `Popen` can block, and a Cancel
         # click must never wait on it. `_proc_starting` is what keeps the
         # window honest while we are in here.
+        #
+        # Reserving the temp sits inside this try for the same reason the
+        # spawn does: it is part of the startup window, and every exit
+        # from that window has to clear `_proc_starting` and let a cancel
+        # that deferred to publication claim the run. A reservation that
+        # fails while the user is cancelling is still a cancellation.
         try:
+            self._reserve_temp()
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,

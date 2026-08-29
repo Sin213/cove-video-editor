@@ -529,8 +529,12 @@ class TerminalSeparationTests(_WinCase):
 class ProductionScopeTests(unittest.TestCase):
     """Tab 2L is an ``app.py``-only slice by construction."""
 
+    # ``exporter.py`` was on this list while Tab 2L was the working tree's
+    # only change. It cannot stay: the guard reads the *current* diff, and
+    # the destination-ownership slice that followed owns the exporter by
+    # design. What Tab 2L asserts here is unchanged - the reveal action
+    # itself still needed nothing outside ``app.py``.
     FORBIDDEN = (
-        "src/cove_video_editor/exporter.py",
         "src/cove_video_editor/system_open.py",
         "src/cove_video_editor/ffmpeg_utils.py",
         "src/cove_video_editor/clip.py",
