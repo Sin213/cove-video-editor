@@ -188,7 +188,11 @@ def parse_sub_cues(path: Path) -> list[tuple[float, float, str]]:
             continue
         start = _parse_sub_ts(m.group(1))
         end = _parse_sub_ts(m.group(2))
-        if end <= start:
+        # A timestamp that could not be converted is not a timestamp of
+        # zero: with a normal end, a collapsed start would pass the check
+        # below and put a cue the file never contained at the head of the
+        # timeline. Either end being unusable makes the whole cue unusable.
+        if start is None or end is None or end <= start:
             continue
         text_lines = lines[ts_idx + 1:]
         text = "\n".join(text_lines).strip()
@@ -198,13 +202,32 @@ def parse_sub_cues(path: Path) -> list[tuple[float, float, str]]:
     return cues
 
 
-def _parse_sub_ts(s: str) -> float:
+def _parse_sub_ts(s: str) -> float | None:
+    """Seconds for one cue timestamp, or ``None`` if it has none.
+
+    ``None`` rather than a fallback number: the caller has to be able to
+    tell "this cue starts at zero" from "this cue has no usable start",
+    and only the second means the cue must go.
+    """
     m = _SUB_TS_RE.match(s)
     if not m:
-        return 0.0
+        return None
     h, mm, ss, frac = m.group(1), m.group(2), m.group(3), m.group(4)
     ms = int(frac.ljust(3, "0")[:3])
-    return int(h) * 3600 + int(mm) * 60 + int(ss) + ms / 1000.0
+    try:
+        return int(h) * 3600 + int(mm) * 60 + int(ss) + ms / 1000.0
+    except (ValueError, OverflowError):
+        # The cue regex puts no bound on the hour field, so a corrupt file
+        # can carry one no float can hold. Two failures live either side of
+        # `sys.get_int_max_str_digits()`: below it the string converts and
+        # the arithmetic overflows; above it `int()` refuses the string
+        # outright with a ValueError. Both mean the same thing here.
+        #
+        # Returning rather than raising is what `parse_sub_cues` promises
+        # its callers, and the project open above it relies on that: the
+        # cue re-parse runs after the session has already been replaced,
+        # so an exception here would leave a half-loaded project behind.
+        return None
 
 
 @dataclass(slots=True)

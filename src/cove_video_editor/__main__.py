@@ -39,7 +39,7 @@ os.environ.setdefault("QT_MEDIA_BACKEND", "ffmpeg")
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from . import theme  # noqa: E402
-from .app import MainWindow  # noqa: E402
+from .app import MainWindow, drain_surviving_media_threads  # noqa: E402
 
 
 def main() -> int:
@@ -49,7 +49,13 @@ def main() -> int:
     theme.apply_theme(app)
     win = MainWindow()
     win.show()
-    return app.exec()
+    code = app.exec()
+    # A media thread the close could not join is parked, and released from
+    # a queued `finished` - which needs an event loop that no longer
+    # exists here. Join it before the interpreter destroys a QThread that
+    # is still running.
+    drain_surviving_media_threads()
+    return code
 
 
 if __name__ == "__main__":

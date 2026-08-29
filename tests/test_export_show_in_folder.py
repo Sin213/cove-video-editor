@@ -534,10 +534,13 @@ class ProductionScopeTests(unittest.TestCase):
     # the destination-ownership slice that followed owns the exporter by
     # design. What Tab 2L asserts here is unchanged - the reveal action
     # itself still needed nothing outside ``app.py``.
+    #
+    # ``clip.py`` comes off for the same reason: the project-open slice
+    # owns ``parse_sub_cues``, whose best-effort contract the transactional
+    # open depends on. Tab 2L's own claim is still what it was.
     FORBIDDEN = (
         "src/cove_video_editor/system_open.py",
         "src/cove_video_editor/ffmpeg_utils.py",
-        "src/cove_video_editor/clip.py",
         "src/cove_video_editor/timeline_widget.py",
         "src/cove_video_editor/theme.py",
         "src/cove_video_editor/titlebar.py",

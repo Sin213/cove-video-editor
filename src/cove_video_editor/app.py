@@ -86,6 +86,7 @@ from PySide6.QtWidgets import (
 
 from . import __version__
 from . import ffmpeg_utils as ff
+from . import project_io
 from . import theme
 from . import updater
 from .system_open import open_local as _open_local
@@ -167,6 +168,123 @@ SUB_FILTERS = _ext_filter("Subtitles", SUB_EXTS) + ";;All files (*)"
 # "All media" combines every supported extension so one browse can pick any
 # file type; the clicked tab's own kind is offered first.
 ALL_MEDIA_FILTER = _ext_filter("All media", MEDIA_EXTS)
+PROJECT_FILTER = (
+    f"Cove project (*{project_io.PROJECT_EXT});;All files (*)"
+)
+
+
+#: How long `closeEvent` waits for one media thread before handing it to
+#: `_survive_media_thread`. Named so tests can shorten it: the behaviour
+#: under test is what happens when the join *fails*, not the duration.
+_CLOSE_JOIN_MS = 1500
+
+#: Media threads that outlived the window that started them.
+#:
+#: `MainWindow._retired_media` is the right owner while the window exists,
+#: but it dies with the window - and a `QThread` whose last reference goes
+#: away while it is still running is destroyed by Qt, which aborts the
+#: process. A worker blocked inside `subprocess.run` cannot honour
+#: `quit()` (it only checks its cancel flag once ffmpeg returns), so a
+#: close can genuinely arrive with one still running.
+#:
+#: This is the same ownership seam as `_retire_media_thread`, only at a
+#: scope that outlives a window: same `(thread, worker)` pair - the worker
+#: too, since it lives on that thread - and the same `finished`-driven
+#: release. Nothing here drives, cancels or joins anything; it only holds
+#: a reference until the thread reports that it has stopped, which is why
+#: closing stays bounded rather than blocking on a thread that will not
+#: stop.
+_SURVIVING_MEDIA_THREADS: list[tuple[QThread, object]] = []
+
+
+def _survive_media_thread(thread: QThread, worker: object) -> None:
+    """Keep ``thread`` (and its worker) referenced past window teardown."""
+    _SURVIVING_MEDIA_THREADS.append((thread, worker))
+    thread.finished.connect(
+        lambda t=thread: _release_surviving_media_thread(t),
+        Qt.QueuedConnection,
+    )
+    # It may have stopped between the timed-out wait and this connect, in
+    # which case `finished` has already been emitted and would never
+    # reach the slot above.
+    if not thread.isRunning():
+        _release_surviving_media_thread(thread)
+
+
+def _release_surviving_media_thread(thread: QThread) -> None:
+    global _SURVIVING_MEDIA_THREADS
+    _SURVIVING_MEDIA_THREADS = [
+        entry for entry in _SURVIVING_MEDIA_THREADS if entry[0] is not thread
+    ]
+
+
+def drain_surviving_media_threads(timeout_ms: int = 8000) -> None:
+    """Join every parked media thread before the interpreter goes away.
+
+    `_survive_media_thread` keeps a thread referenced past the window that
+    started it, and releases it from `finished`. Both halves need a
+    *running event loop*: once `exec()` returns there is nothing left to
+    deliver a queued signal, so a thread parked at 1.5s that only stops at
+    2.0s is still running when the interpreter tears its `QThread` down -
+    which aborts the process. Holding a reference does not prevent that;
+    only joining does.
+
+    So this is the last step of application shutdown, after the UI is
+    already gone and there is nobody left to block. It is bounded because
+    cancellation is: each worker kills its ffmpeg child after
+    `thumbnails._TERMINATE_GRACE_S` and returns, so the joins below take
+    about that long in the worst case rather than as long as ffmpeg. The
+    cancel is repeated here because a worker that had already re-entered
+    ffmpeg still needs telling.
+    """
+    deadline = time.monotonic() + max(0, timeout_ms) / 1000.0
+    for thread, worker in list(_SURVIVING_MEDIA_THREADS):
+        try:
+            worker.cancel()
+        except Exception:  # noqa: BLE001
+            pass
+        thread.quit()
+    for thread, _worker in list(_SURVIVING_MEDIA_THREADS):
+        remaining = int((deadline - time.monotonic()) * 1000)
+        thread.wait(max(0, remaining))
+    # Only entries whose thread really stopped may be dropped: releasing a
+    # still-running one here would be the very abort this exists to avoid.
+    _SURVIVING_MEDIA_THREADS[:] = [
+        entry for entry in _SURVIVING_MEDIA_THREADS if entry[0].isRunning()
+    ]
+
+
+def _join_or_survive(thread: QThread, worker: object) -> None:
+    """Stop ``thread`` if it will stop, and keep owning it if it will not.
+
+    The whole point is the return value of ``wait()``: ``False`` means the
+    thread is still running, and releasing it there is the abort.
+    """
+    if not thread.isRunning():
+        return
+    thread.quit()
+    if not thread.wait(_CLOSE_JOIN_MS):
+        _survive_media_thread(thread, worker)
+
+
+def _forget_worker(
+    threads: dict, workers: dict, key: str, thread: QThread,
+) -> None:
+    """Drop ``key`` from the media-worker registries, but only if it still
+    points at ``thread``.
+
+    The completion callbacks are queued connections carrying a clip or
+    audio id, and a saved project keeps its ids: an outgoing project's
+    ``finished`` can therefore be delivered *after* the incoming project
+    has registered its own worker under the very same id. Popping by id
+    alone would drop the live thread's only reference and destroy a
+    running QThread. Identity is what distinguishes them - no generation
+    counter is needed, because the registry entry itself is the token.
+    """
+    if threads.get(key) is not thread:
+        return
+    threads.pop(key, None)
+    workers.pop(key, None)
 
 
 def _name_sort_key(name: str) -> tuple[str, str]:
@@ -1021,6 +1139,22 @@ class MainWindow(QMainWindow):
         self._added_wave_workers: dict[str, object] = {}
         self._export_thread: QThread | None = None
         self._export_worker = None
+        # The export run this window has stopped answering to, if any.
+        #
+        # Opening a project does not stop a running export - it never has -
+        # but it does replace the session that export belongs to, and its
+        # callbacks carry progress, log lines, a completion summary and a
+        # "Show in folder" target for a file the incoming timeline never
+        # produced. Disconnecting the worker at the swap would not be
+        # enough on its own: a signal already queued is delivered whatever
+        # happens to the connection afterwards, so ownership is checked
+        # when each callback *runs*.
+        #
+        # One slot is enough. Only a live run is ever disowned (see
+        # `_apply_project_state`), and a second one can only exist once the
+        # first thread has finished and released the export controls - by
+        # which time the first run has no callbacks left to deliver.
+        self._disowned_export = None
         # Output of the most recent *successful* export, and nothing else -
         # the only thing "Show in folder" needs. Cleared when a new export
         # starts so the action can never point at a previous run's file.
@@ -1035,6 +1169,18 @@ class MainWindow(QMainWindow):
         # Subtitle library. Zero or more loaded SRT/VTT files; at most one
         # may be `active` and gets burned in on export.
         self._subs: list[SubtitleTrack] = []
+
+        # Thumbnail/waveform threads that outlived a project swap's join
+        # budget, held as (thread, worker) until they really finish. See
+        # `_stop_media_workers`.
+        self._retired_media: list[tuple[QThread, object]] = []
+
+        # Where "Save Project" writes. None until the session has been
+        # saved once or opened from a file; Save then behaves as Save As.
+        # Only ever advanced *after* a save or load has fully succeeded, so
+        # a failed or cancelled dialog can never repoint it at a file that
+        # does not hold this session.
+        self._current_project_path: Path | None = None
 
         # Undo / redo stacks — each entry is a full state snapshot. A new
         # snapshot (user action) clears the redo stack, same as Photoshop.
@@ -1186,6 +1332,10 @@ class MainWindow(QMainWindow):
     # --- shortcuts -----------------------------------------------------
 
     def _install_shortcuts(self) -> None:
+        QShortcut(QKeySequence.Open, self).activated.connect(self._on_open_project)
+        QShortcut(QKeySequence.Save, self).activated.connect(self._on_save_project)
+        QShortcut(QKeySequence("Ctrl+Shift+S"), self).activated.connect(
+            self._on_save_project_as)
         QShortcut(QKeySequence.Undo, self).activated.connect(self._undo)
         QShortcut(QKeySequence.Redo, self).activated.connect(self._redo)
         # Ctrl+Y as an explicit redo binding — QKeySequence.Redo is
@@ -1402,6 +1552,290 @@ class MainWindow(QMainWindow):
         if self._crop_edit_clip_id:
             self._finish_crop_edit(commit=False)
 
+    # --- project save / open ------------------------------------------
+
+    def _stop_media_workers(self, wait_ms: int = 1500) -> None:
+        """Cancel every thumbnail / waveform worker, join what stops, and
+        empty the id-keyed registries.
+
+        A worker sitting inside ``subprocess.run`` cannot honour
+        ``quit()``: it only looks at its cancel flag once ffmpeg returns.
+        So the join is allowed to time out - but the registry entry is
+        still the only reference to that ``QThread``, and releasing a
+        running QThread aborts the process. Anything that outlives the
+        wait moves to ``_retired_media``, which holds the thread *and* its
+        worker (the worker lives on that thread) until it really finishes.
+        The registries themselves must come out clean either way: the
+        incoming project keys its own workers by the same clip ids.
+
+        ``wait_ms`` is one budget for the whole call, not one per worker.
+        Waiting per worker made the cost linear in how many were stalled -
+        opening a project behind a few dozen of them would have frozen the
+        window for a minute. Each thread gets whatever is left of the
+        budget; once it is spent the rest are retired immediately, which
+        costs nothing and loses nothing because retirement keeps owning
+        them until they stop.
+
+        ``closeEvent`` runs an equivalent teardown of its own because it
+        has to interleave the media workers with the export worker and the
+        download dialog in a specific order; that ordering is load-bearing
+        on shutdown and is deliberately left alone.
+        """
+        for workers in (self._thumb_workers, self._wave_workers,
+                        self._added_wave_workers):
+            for worker in list(workers.values()):
+                try:
+                    worker.cancel()
+                except Exception:  # noqa: BLE001
+                    pass
+        deadline = time.monotonic() + max(0, wait_ms) / 1000.0
+        for threads, workers in (
+            (self._thumb_threads, self._thumb_workers),
+            (self._wave_threads, self._wave_workers),
+            (self._added_wave_threads, self._added_wave_workers),
+        ):
+            for key, thread in list(threads.items()):
+                if thread.isRunning():
+                    thread.quit()
+                    remaining = int((deadline - time.monotonic()) * 1000)
+                    if remaining <= 0 or not thread.wait(remaining):
+                        self._retire_media_thread(thread, workers.get(key))
+            threads.clear()
+            workers.clear()
+
+    def _retire_media_thread(self, thread: QThread, worker: object) -> None:
+        """Hold a thread that would not stop in time, until it does."""
+        entry = (thread, worker)
+        self._retired_media.append(entry)
+        thread.finished.connect(
+            lambda t=thread: self._drop_retired_media(t), Qt.QueuedConnection,
+        )
+        # It may have finished between the timed-out wait and the connect,
+        # in which case `finished` has already been emitted and would
+        # never reach the slot above.
+        if not thread.isRunning():
+            self._drop_retired_media(thread)
+
+    def _drop_retired_media(self, thread: QThread) -> None:
+        self._retired_media = [
+            entry for entry in self._retired_media if entry[0] is not thread
+        ]
+
+    def _project_state(self) -> project_io.ProjectState:
+        """The authoritative user edit state of this session.
+
+        Deliberately the live objects: ``project_io`` only reads them, and
+        a defensive clone here would hide a serializer that mutated the
+        session.
+        """
+        return project_io.ProjectState(
+            assets=list(self._assets.values()),
+            clips=list(self._clips),
+            added_audios=list(self._added_audios),
+            subtitles=list(self._subs),
+            replace_added_audio=self.audio_replace_cb.isChecked(),
+            added_gain=float(self.audio_gain.value()),
+            original_gain=float(self.orig_gain.value()),
+        )
+
+    def _report_project_problem(self, headline: str, detail: object) -> None:
+        """Report a save/open failure the way the app reports every other
+        user-requested file operation that went wrong: a status line plus
+        the detail in the log panel, and a modal because the user asked
+        for this action and nothing happened.
+        """
+        text = str(detail)
+        short = text.splitlines()[0][:160] if text else headline
+        self.status.showMessage(f"{headline}: {short}", 8000)
+        self.export_log.append(f"{headline}: {text}")
+        QMessageBox.warning(self, headline, text)
+
+    def _save_project_to(self, path: Path) -> bool:
+        """Serialize the session to ``path``. Returns True on success.
+
+        An open crop draft is committed first, through the ordinary crop
+        lifecycle, so what the user can see on the preview is what lands
+        in the file - saving a stale confirmed rect while a newer draft is
+        on screen would silently discard the visible edit.
+        """
+        self._finish_crop_edit(commit=True)
+        try:
+            project_io.save_project(path, self._project_state())
+        except (project_io.ProjectError, OSError) as exc:
+            self._report_project_problem("Could not save project", exc)
+            return False
+        self._current_project_path = path
+        self.status.showMessage(f"Project saved: {path.name}", 5000)
+        return True
+
+    def _on_save_project(self) -> None:
+        if self._current_project_path is None:
+            self._on_save_project_as()
+            return
+        self._save_project_to(self._current_project_path)
+
+    def _on_save_project_as(self) -> None:
+        suggested = str(
+            self._current_project_path
+            or Path.home() / f"untitled{project_io.PROJECT_EXT}",
+        )
+        out, _ = QFileDialog.getSaveFileName(
+            self, "Save project as…", suggested, PROJECT_FILTER,
+        )
+        if not out:
+            return
+        self._save_project_to(project_io.normalize_project_path(Path(out)))
+
+    def _on_open_project(self) -> None:
+        start = str(self._current_project_path or "")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open project", start, PROJECT_FILTER,
+        )
+        if not path:
+            return
+        self._open_project_path(Path(path))
+
+    def _open_project_path(self, path: Path) -> bool:
+        """Load ``path`` and replace the session with it. Returns True on
+        success.
+
+        Everything that can fail - reading, parsing, schema validation,
+        model construction, media existence - happens inside
+        ``load_project`` before a single field of this window is touched.
+        A rejected project therefore leaves the current session exactly as
+        it was rather than half-replaced.
+        """
+        try:
+            state = project_io.load_project(path)
+        except (project_io.ProjectError, OSError) as exc:
+            self._report_project_problem("Could not open project", exc)
+            return False
+        self._apply_project_state(state)
+        self._current_project_path = path
+        self.status.showMessage(f"Project opened: {path.name}", 5000)
+        return True
+
+    def _apply_project_state(self, state: project_io.ProjectState) -> None:
+        """Commit a validated candidate session. The point of no return.
+
+        Called only after ``load_project`` has succeeded, so this method
+        never has to undo anything: it replaces every piece of session
+        state wholesale and resets the runtime state that belonged to the
+        outgoing project.
+        """
+        # Runtime state of the *previous* project, dropped before the swap.
+        if self._crop_edit_clip_id:
+            self._finish_crop_edit(commit=False)
+        if self._play_timer.isActive():
+            self._toggle_play()
+        # The outgoing project's analysis workers must be gone before the
+        # incoming one starts its own: both key their registries by clip
+        # id, a saved project keeps its ids, so reopening a project whose
+        # thumbnails are still generating would overwrite the entry
+        # holding a running QThread - and dropping the last reference to a
+        # running QThread aborts the process. Their results are also
+        # addressed by id, so a late callback would paint the outgoing
+        # project's frames onto the incoming clips.
+        self._stop_media_workers()
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        # A reveal target from the old project would point "Show in
+        # folder" at an export the loaded timeline never produced - and so
+        # would the outgoing export's own `finished`, which is still
+        # coming. Clearing the target handles what has already happened;
+        # disowning the run handles what has not happened yet. Only a live
+        # run is disowned, so a rejected open - which never reaches this
+        # method - leaves the current export owning its window.
+        self._set_last_export_output(None)
+        if self._export_worker is not None:
+            self._disowned_export = self._export_worker
+        self._region_export_range = None
+        self.timeline.clear_selection()
+        self.timeline.select_clip("")
+
+        # Media bin: rebuilt, not appended to.
+        for asset_id in list(self._assets):
+            self.clip_bin.remove_asset(asset_id)
+        self._assets.clear()
+        self._image_pixmaps.clear()
+        for asset in state.assets:
+            if asset.kind == "image":
+                img = QImage(str(asset.path))
+                if not img.isNull():
+                    asset.thumb = img
+                    self._image_pixmaps[asset.id] = QPixmap.fromImage(img)
+            self._assets[asset.id] = asset
+            self.clip_bin.add_asset(asset)
+
+        # Subtitle library. Cues are re-parsed from the file rather than
+        # stored: they are a derived view of the .srt, and a project that
+        # cached them would drift the moment the file was edited.
+        for sub in self._subs:
+            self.clip_bin.remove_sub(sub.id)
+        self._subs = list(state.subtitles)
+        for sub in self._subs:
+            sub.cues = parse_sub_cues(sub.path)
+            self.clip_bin.add_sub(
+                sub.id, sub.path.name, str(sub.path), sub.active)
+        active = next((s for s in self._subs if s.active), None)
+        self.clip_bin.set_active_sub(active.id if active else "")
+
+        # Audio mix. Signals blocked: these setters would otherwise be
+        # read as fresh user edits and push undo snapshots of a project
+        # that is only half swapped in.
+        for widget, value in (
+            (self.audio_replace_cb, state.replace_added_audio),
+        ):
+            widget.blockSignals(True)
+            widget.setChecked(bool(value))
+            widget.blockSignals(False)
+        for widget, value in (
+            (self.audio_gain, state.added_gain),
+            (self.orig_gain, state.original_gain),
+        ):
+            widget.blockSignals(True)
+            widget.setValue(float(value))
+            widget.blockSignals(False)
+        self.timeline.set_added_audio_replace(bool(state.replace_added_audio))
+
+        # Timeline clips.
+        self._clips = sort_clips(state.clips)
+        self.timeline.set_clips(self._clips)
+        for clip in self._clips:
+            if clip.asset.kind == "image":
+                self._seed_image_clip_thumbs(clip)
+            else:
+                self._kick_off_thumbs(clip)
+                if clip.asset.has_audio:
+                    self._kick_off_waveform(clip)
+
+        # Added audio. Every player is torn down first rather than reused:
+        # `_restore_added_audios` keeps a player whose id still appears,
+        # which is right for undo (same session, same files) but wrong
+        # across projects - two documents can carry the same id on
+        # different files, and a retained player would keep the outgoing
+        # project's audio under the new timeline.
+        for audio_id in list(self._added_players):
+            self._destroy_added_player(audio_id)
+        self._restore_added_audios(state.added_audios)
+        self._refresh_added_audio_display()
+        for audio in self._added_audios:
+            self._kick_off_added_waveform(audio.id, audio.path)
+
+        # Preview and transport. Nothing auto-plays: opening a project is
+        # not a request to start watching it.
+        self.timeline.set_playhead(0.0, emit=False)
+        if self._clips:
+            self._set_preview_clip(sort_clips(self._clips)[0])
+        else:
+            self._preview_clip_id = ""
+            self.player.setSource(QUrl())
+            self._sync_crop_indicator()
+        self._update_audio_volumes()
+        self._sync_selected_clip_ui()
+        self._update_range_label()
+        self._update_controls_enabled()
+
     # --- UI construction ----------------------------------------------
 
     def _build_ui(self) -> None:
@@ -1577,6 +2011,21 @@ class MainWindow(QMainWindow):
         divider.setStyleSheet(f"background:{theme.BORDER};")
         transport.addWidget(divider)
 
+        # Project actions. The window is frameless and has no menu bar, so
+        # the transport row's own convention - a button that pops a QMenu,
+        # same as Merge - is what makes them discoverable.
+        self.project_btn = QPushButton("Project ▾")
+        self.project_btn.setToolTip(
+            "Save or open a Cove project (Ctrl+O, Ctrl+S, Ctrl+Shift+S)")
+        self.project_menu = QMenu(self)
+        self.project_open_act = self.project_menu.addAction(
+            "Open Project…\tCtrl+O", self._on_open_project)
+        self.project_save_act = self.project_menu.addAction(
+            "Save Project\tCtrl+S", self._on_save_project)
+        self.project_save_as_act = self.project_menu.addAction(
+            "Save Project As…\tCtrl+Shift+S", self._on_save_project_as)
+        self.project_btn.setMenu(self.project_menu)
+
         self.split_btn = QPushButton("Split")
         self.split_btn.setToolTip("Split the clip under the playhead (S)")
         self.split_btn.clicked.connect(self._split_at_playhead)
@@ -1618,6 +2067,8 @@ class MainWindow(QMainWindow):
         self.range_label = QLabel("—")
         self.range_label.setObjectName("RangeLabel")
 
+        transport.addWidget(self.project_btn)
+        transport.addSpacing(4)
         transport.addWidget(self.split_btn)
         transport.addWidget(self.merge_btn)
         transport.addWidget(self.delete_clip_btn)
@@ -2468,7 +2919,8 @@ class MainWindow(QMainWindow):
         worker.finished.connect(self._on_thumbs_ready, Qt.QueuedConnection)
         worker.failed.connect(self._on_thumb_error, Qt.QueuedConnection)
         thread.finished.connect(
-            lambda cid=clip.id: self._thumb_done(cid), Qt.QueuedConnection,
+            lambda cid=clip.id, t=thread: self._thumb_done(cid, t),
+            Qt.QueuedConnection,
         )
         self._thumb_threads[clip.id] = thread
         self._thumb_workers[clip.id] = worker
@@ -2479,21 +2931,31 @@ class MainWindow(QMainWindow):
         worker.finished.connect(self._on_waveform_ready, Qt.QueuedConnection)
         worker.failed.connect(self._on_waveform_error, Qt.QueuedConnection)
         thread.finished.connect(
-            lambda cid=clip.id: self._wave_done(cid), Qt.QueuedConnection,
+            lambda cid=clip.id, t=thread: self._wave_done(cid, t),
+            Qt.QueuedConnection,
         )
         self._wave_threads[clip.id] = thread
         self._wave_workers[clip.id] = worker
         thread.start()
 
-    def _thumb_done(self, clip_id: str) -> None:
-        self._thumb_threads.pop(clip_id, None)
-        self._thumb_workers.pop(clip_id, None)
+    def _thumb_done(self, clip_id: str, thread: QThread) -> None:
+        _forget_worker(self._thumb_threads, self._thumb_workers,
+                       clip_id, thread)
 
-    def _wave_done(self, clip_id: str) -> None:
-        self._wave_threads.pop(clip_id, None)
-        self._wave_workers.pop(clip_id, None)
+    def _wave_done(self, clip_id: str, thread: QThread) -> None:
+        _forget_worker(self._wave_threads, self._wave_workers,
+                       clip_id, thread)
 
     def _on_thumbs_ready(self, clip_id: str, images: list) -> None:
+        # `ThumbnailWorker.run` has no cancellation check before its final
+        # emit, and a retired worker finishes on its own schedule - so a
+        # result can arrive after a project swap and resolve against the
+        # incoming clip that reuses this id. The registry entry is the
+        # identity token; `sender()` is what the connection makes
+        # available without giving up the bound-method receiver that keeps
+        # this slot on the GUI thread.
+        if self._thumb_workers.get(clip_id) is not self.sender():
+            return
         clip = next((c for c in self._clips if c.id == clip_id), None)
         if not clip:
             return
@@ -2508,6 +2970,8 @@ class MainWindow(QMainWindow):
         self.status.showMessage(f"Thumbnail error: {msg}", 4000)
 
     def _on_waveform_ready(self, clip_id: str, peaks: list, rate: int) -> None:
+        if self._wave_workers.get(clip_id) is not self.sender():
+            return
         clip = next((c for c in self._clips if c.id == clip_id), None)
         if clip and peaks:
             clip.waveform_peaks = list(peaks)
@@ -3953,16 +4417,21 @@ class MainWindow(QMainWindow):
             except Exception:  # noqa: BLE001
                 pass
         thread, worker = start_waveform(audio_id, path)
-        worker.finished.connect(self._on_added_waveform_ready, Qt.QueuedConnection)
+        worker.finished.connect(
+            self._on_added_waveform_ready, Qt.QueuedConnection)
         worker.failed.connect(self._on_added_waveform_error, Qt.QueuedConnection)
         thread.finished.connect(
-            lambda aid=audio_id: self._added_wave_done(aid), Qt.QueuedConnection,
+            lambda aid=audio_id, t=thread: self._added_wave_done(aid, t),
+            Qt.QueuedConnection,
         )
         self._added_wave_threads[audio_id] = thread
         self._added_wave_workers[audio_id] = worker
         thread.start()
 
-    def _on_added_waveform_ready(self, audio_id: str, peaks: list, rate: int) -> None:
+    def _on_added_waveform_ready(self, audio_id: str, peaks: list,
+                                 rate: int) -> None:
+        if self._added_wave_workers.get(audio_id) is not self.sender():
+            return
         audio = next((a for a in self._added_audios if a.id == audio_id), None)
         if audio is None or not peaks:
             return
@@ -3973,9 +4442,9 @@ class MainWindow(QMainWindow):
     def _on_added_waveform_error(self, _audio_id: str, _msg: str) -> None:
         pass
 
-    def _added_wave_done(self, audio_id: str) -> None:
-        self._added_wave_threads.pop(audio_id, None)
-        self._added_wave_workers.pop(audio_id, None)
+    def _added_wave_done(self, audio_id: str, thread: QThread) -> None:
+        _forget_worker(self._added_wave_threads, self._added_wave_workers,
+                       audio_id, thread)
 
     # --- export -------------------------------------------------------
 
@@ -4284,18 +4753,38 @@ class MainWindow(QMainWindow):
     def _on_copy_log(self) -> None:
         QApplication.clipboard().setText(self.export_log.toPlainText())
 
+    def _stale_export_callback(self) -> bool:
+        """True when the signal being handled belongs to a disowned run.
+
+        Deliberately narrow: a callback is stale only when its sender is
+        the exact run this window gave up at a project-open commit.
+        Anything else is current by definition - including a direct call,
+        where `sender()` is None, and a worker driven by something other
+        than `_on_export_clicked`. Widening this to "anything that is not
+        the current worker" would be the blanket ignore that makes a live
+        export stop reporting.
+        """
+        return self.sender() is not None and \
+            self.sender() is self._disowned_export
+
     def _on_worker_log(self, msg: str) -> None:
+        if self._stale_export_callback():
+            return
         self.export_log.append(msg)
         # Show the first command line in status bar; suppress noisy stderr lines.
         if msg.startswith("$ "):
             self.status.showMessage(msg, 4000)
 
     def _on_progress(self, pct: int) -> None:
+        if self._stale_export_callback():
+            return
         self._last_progress = max(self._last_progress, pct)
         self.progress.setValue(self._last_progress)
         self._refresh_progress_text()
 
     def _on_eta(self, seconds: float) -> None:
+        if self._stale_export_callback():
+            return
         self._last_eta = seconds
         self._refresh_progress_text()
 
@@ -4308,6 +4797,12 @@ class MainWindow(QMainWindow):
             self.progress.setFormat(f"%p%  •  ETA {m}:{s:02d}")
 
     def _on_export_done(self, out: Path) -> None:
+        if self._stale_export_callback():
+            # The export really did succeed, but for a session this window
+            # no longer holds. Reporting it here would credit the incoming
+            # project with a file it never produced, and arm "Show in
+            # folder" on it.
+            return
         # The encode succeeded, so the export is done either way; only the
         # size is in doubt if the file vanished between ffmpeg finishing
         # and this slot running. Never invent a size, never crash the slot.
@@ -4361,6 +4856,10 @@ class MainWindow(QMainWindow):
         self.export_log.append(detail)
 
     def _on_export_failed(self, msg: str) -> None:
+        if self._stale_export_callback():
+            # A modal about the previous project's export, over the
+            # project the user just opened, is the loudest form of this.
+            return
         # First line as short status; full detail goes to the log panel.
         short = msg.splitlines()[0][:120] if msg else "Unknown error"
         self.status.showMessage(f"Failed: {short}", 8000)
@@ -4382,14 +4881,22 @@ class MainWindow(QMainWindow):
         shared `thread.finished -> _reset_after_export` path, same as a
         completed or failed export.
         """
+        if self._stale_export_callback():
+            return
         self.status.showMessage("Export cancelled", 8000)
         self.export_log.append("Export cancelled")
         self._last_eta = None
         self._refresh_progress_text()
 
     def _reset_after_export(self) -> None:
+        # Deliberately not guarded: this is the outgoing thread releasing
+        # the export controls, which a swapped-in project needs to happen
+        # whether or not the run still owns the UI. It also runs after the
+        # run's last worker signal - `thread.finished` cannot precede
+        # them - so dropping the disowned reference here strands nothing.
         self._export_thread = None
         self._export_worker = None
+        self._disowned_export = None
         self.cancel_btn.setEnabled(False)
         self._update_controls_enabled()
 
@@ -4469,10 +4976,27 @@ class MainWindow(QMainWindow):
         if self._download_dialog is not None:
             self._download_dialog.cancel_and_wait()
             self._download_dialog.close()
-        for d in (self._thumb_threads, self._wave_threads, self._added_wave_threads):
-            for thread in list(d.values()):
-                if thread.isRunning():
-                    thread.quit(); thread.wait(1500)
+        # Every media thread goes through the same rule: joined if it will
+        # join, still owned if it will not. Dropping one that is still
+        # running - which is what ignoring `wait()`'s result did - lets Qt
+        # destroy a live QThread and abort the process.
+        for threads, workers in (
+            (self._thumb_threads, self._thumb_workers),
+            (self._wave_threads, self._wave_workers),
+            (self._added_wave_threads, self._added_wave_workers),
+        ):
+            for key, thread in list(threads.items()):
+                _join_or_survive(thread, workers.get(key))
+        # Threads a project swap already could not join. Their workers
+        # were cancelled when they were retired, but cancel again: a
+        # worker that has since re-entered ffmpeg still needs telling.
+        for thread, worker in list(self._retired_media):
+            try:
+                worker.cancel()
+            except Exception:  # noqa: BLE001
+                pass
+            _join_or_survive(thread, worker)
+        self._retired_media = []
         if self._export_thread and self._export_thread.isRunning():
             self._export_thread.quit(); self._export_thread.wait(2000)
         self._stop_encoder_probe()

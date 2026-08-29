@@ -285,19 +285,50 @@ class CropDormancyGuardTests(unittest.TestCase):
 
 
 class CropSerializationAuditTests(unittest.TestCase):
-    """Group H - there is no persistent project/save format for ``Clip``, so
-    the new fields need no migration. This guards the audit result: if a
-    serializer ever appears it must consider crop state explicitly."""
+    """Group H - the audit's original result was "no serializer exists, so
+    the new crop fields need no migration", with a guard demanding that any
+    serializer which later appeared must handle crop state explicitly.
 
-    def test_h1_no_clip_serialization_path_exists(self) -> None:
+    Tab 2N introduced exactly one: ``project_io.py``. The guard therefore
+    changes shape rather than disappearing - it now pins the serializer to
+    that single module and requires it to name both crop fields. A second
+    serialization path, or one that quietly dropped ``crop_rect`` /
+    ``crop_preset``, would still be caught here."""
+
+    #: The one module allowed to turn models into a stored document.
+    SERIALIZER = "project_io.py"
+
+    def test_h1_project_io_is_the_only_serialization_path(self) -> None:
+        import cove_video_editor
+
+        pkg = Path(cove_video_editor.__file__).parent
+        offenders = []
+        for path in sorted(pkg.glob("*.py")):
+            if path.name == self.SERIALIZER:
+                continue
+            src = path.read_text(encoding="utf-8")
+            for marker in ("dataclasses.asdict", "asdict(", "json.dump",
+                           "pickle.dump"):
+                if marker in src:
+                    offenders.append(f"{path.name}: {marker}")
+        self.assertEqual(offenders, [])
+
+    def test_h2_the_serializer_handles_crop_state_explicitly(self) -> None:
+        import cove_video_editor
+
+        src = (Path(cove_video_editor.__file__).parent
+               / self.SERIALIZER).read_text(encoding="utf-8")
+        self.assertIn("crop_rect", src)
+        self.assertIn("crop_preset", src)
+
+    def test_h3_no_unsafe_deserialization_path_exists(self) -> None:
         import cove_video_editor
 
         pkg = Path(cove_video_editor.__file__).parent
         offenders = []
         for path in sorted(pkg.glob("*.py")):
             src = path.read_text(encoding="utf-8")
-            for marker in ("dataclasses.asdict", "asdict(", "json.dump",
-                           "pickle.dump"):
+            for marker in ("pickle", "marshal", "shelve", "yaml.load"):
                 if marker in src:
                     offenders.append(f"{path.name}: {marker}")
         self.assertEqual(offenders, [])
