@@ -23,7 +23,7 @@ def finish(s, started, state="SUCCEEDED"):
     assert completed, job.snapshot()
     assert not job.owner.is_alive() and not job.supervisor.is_alive()
     result = s.get_export_status(job.job_id)
-    assert result["state"] == state, result
+    assert result["state"] == state, (result, result["error"])
     assert result["leftover"] is None, result
     return result
 

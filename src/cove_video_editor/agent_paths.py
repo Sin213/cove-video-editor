@@ -10,8 +10,11 @@ MAX_PATHS, MAX_PATH_CHARS, MAX_NAME, MAX_PROJECTS = 50, 4096, 80, 20
 MAX_ASSETS, MAX_CLIPS, MAX_TIMELINE, MAX_WARNINGS = 200, 200, 86400, 50
 PROBE_TIMEOUT, PROBE_BUDGET, PROBE_OUTPUT_CAP = 10, 60, 65536
 EXTENSIONS = frozenset({".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"})
+AUDIO_EXTENSIONS = frozenset({".mp3", ".m4a", ".aac", ".wav", ".ogg", ".opus", ".flac"})
+MAX_AUDIO_ITEMS, MAX_AUDIO_LANE = 50, 63
 INPUT_OPTIONS = ("-protocol_whitelist", "file", "-format_whitelist",
                  "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi")
+AUDIO_INPUT_OPTIONS = (*INPUT_OPTIONS[:-1], INPUT_OPTIONS[-1] + ",mp3,wav,flac,ogg,aac")
 ERROR_CODES = frozenset("INVALID_ARGUMENT NOT_CONFIGURED PATH_NOT_AUTHORIZED FILE_NOT_FOUND "
     "NOT_A_REGULAR_FILE UNSUPPORTED_EXTENSION UNSUPPORTED_MEDIA PROBE_TIMEOUT PROBE_FAILED "
     "PROBE_OUTPUT_TOO_LARGE PROBE_BUDGET_EXCEEDED LIMIT_EXCEEDED UNKNOWN_PROJECT UNKNOWN_ASSET "
@@ -22,7 +25,8 @@ ERROR_CODES = frozenset("INVALID_ARGUMENT NOT_CONFIGURED PATH_NOT_AUTHORIZED FIL
 LIMITS = dict(paths=MAX_PATHS, path_chars=MAX_PATH_CHARS, name_chars=MAX_NAME,
     projects=MAX_PROJECTS, assets=MAX_ASSETS, clips=MAX_CLIPS, timeline_s=MAX_TIMELINE,
     probe_timeout_s=PROBE_TIMEOUT, probe_budget_s=PROBE_BUDGET,
-    probe_output_bytes=PROBE_OUTPUT_CAP, warnings=MAX_WARNINGS)
+    probe_output_bytes=PROBE_OUTPUT_CAP, warnings=MAX_WARNINGS,
+    audio_items=MAX_AUDIO_ITEMS, audio_lane_max=MAX_AUDIO_LANE)
 class AgentError(Exception):
     def __init__(self, code: str, message: str):
         if code == "PATH_NOT_AUTHORIZED" and "See cove_get_capabilities media_roots." not in message:
@@ -70,7 +74,9 @@ def file_identity(st) -> tuple[int, int, int, int]:
 def _media_hook(stage: str) -> None:
     """Deterministic race seam; production has no hook behavior."""
 @contextmanager
-def open_authorized_media(policy: PathPolicy, path: str):
+def open_authorized_media(policy: PathPolicy, path: str, *, kind: str = "video"):
+    if kind not in {"video", "audio"}:
+        raise AgentError("INVALID_ARGUMENT", "Use video or audio media.")
     reject_unsafe_path_text(path)
     if not policy.media_roots:
         raise AgentError("NOT_CONFIGURED", "Configure a media root at startup.")
@@ -79,8 +85,8 @@ def open_authorized_media(policy: PathPolicy, path: str):
     canonical = os.path.realpath(path)
     if not _contained(canonical, policy.media_roots):
         raise AgentError("PATH_NOT_AUTHORIZED", "Path is outside authorized media roots. See cove_get_capabilities media_roots.")
-    if Path(canonical).suffix.lower() not in EXTENSIONS:
-        raise AgentError("UNSUPPORTED_EXTENSION", "Only supported video extensions are accepted.")
+    if Path(canonical).suffix.lower() not in (AUDIO_EXTENSIONS if kind == "audio" else EXTENSIONS):
+        raise AgentError("UNSUPPORTED_EXTENSION", f"Only supported {kind} extensions are accepted.")
     _media_hook("before_open")
     try:
         # Open once; O_NOFOLLOW refuses a symlink swapped in after authorization.
@@ -101,14 +107,24 @@ def open_authorized_media(policy: PathPolicy, path: str):
         yield fd, canonical, file_identity(st)
     finally:
         os.close(fd)
-def probe_fd(fd: int, *, timeout: float = PROBE_TIMEOUT) -> dict:
+def probe_fd(fd: int, *, timeout: float = PROBE_TIMEOUT, kind: str = "video") -> dict:
+    if kind not in {"video", "audio"}:
+        raise AgentError("INVALID_ARGUMENT", "Use video or audio media.")
     try:
         binary = require_ffprobe()
     except FFmpegMissingError:
         raise AgentError("PROBE_FAILED", "ffprobe is unavailable. Install FFmpeg (ffprobe).") from None
     # Probe the held fd with whitelists: rejecting metadata afterward is not access control.
-    cmd = [binary, "-v", "error", *INPUT_OPTIONS,
-        "-show_entries", "stream=codec_type,codec_name,width,height,r_frame_rate:format=duration,format_name",
+    entries = "stream=codec_type,codec_name,width,height,r_frame_rate:format=duration,format_name"
+    options = INPUT_OPTIONS
+    decoding = []
+    if kind == "audio":
+        options = AUDIO_INPUT_OPTIONS
+        # Decode a bounded initial window, without returning frames or raw metadata.
+        decoding = ["-count_frames", "-read_intervals", "%+1"]
+        entries += ":stream=nb_read_frames:stream_disposition=attached_pic"
+    cmd = [binary, "-v", "error", *options, *decoding,
+        "-show_entries", entries,
         "-of", "json", "-i", f"/dev/fd/{fd}"]
     try:
         proc = subprocess.Popen(cmd, pass_fds=(fd,), stdin=subprocess.DEVNULL,
@@ -150,6 +166,20 @@ def probe_fd(fd: int, *, timeout: float = PROBE_TIMEOUT) -> dict:
     try:
         doc = json.loads(data)
         streams = doc.get("streams", [])
+        if kind == "audio":
+            a = next((s for s in streams if s.get("codec_type") == "audio"), None)
+            if any(s.get("codec_type") == "video" and s.get("disposition", {}).get("attached_pic") != 1 for s in streams):
+                raise AgentError("UNSUPPORTED_MEDIA", "Choose audio without a real video stream; cover art is allowed.")
+            if a is None or int(a.get("nb_read_frames", "0")) <= 0:
+                raise AgentError("UNSUPPORTED_MEDIA", "A decodable audio stream is required.")
+            fmt = doc["format"]
+            duration = float(fmt["duration"])
+            if not math.isfinite(duration) or not 0 < duration <= MAX_TIMELINE:
+                raise ValueError()
+            values = [fmt["format_name"], *(s["codec_name"] for s in streams)]
+            if any(type(s) is not str or not re.fullmatch(r"[A-Za-z0-9_,.-]{1,100}", s) for s in values):
+                raise ValueError()
+            return dict(kind="audio", duration_s=duration, audio_codec=a["codec_name"], container=values[0])
         v = next((s for s in streams if s.get("codec_type") == "video"), None)
         if v is None:
             raise AgentError("UNSUPPORTED_MEDIA", "A video stream is required.")
@@ -169,7 +199,7 @@ def probe_fd(fd: int, *, timeout: float = PROBE_TIMEOUT) -> dict:
             has_audio=a is not None, video_codec=values[0], audio_codec=values[2] if a else None,
             container=values[1])
     except (ValueError, KeyError, TypeError, AttributeError, OverflowError):
-        raise AgentError("PROBE_FAILED", "Invalid video metadata.") from None
+        raise AgentError("PROBE_FAILED", f"Invalid {kind} metadata.") from None
 def create_project_dir(policy: PathPolicy, name: str) -> int:
     if policy.output_fd is None:
         raise AgentError("NOT_CONFIGURED", "Configure an output root at startup.")

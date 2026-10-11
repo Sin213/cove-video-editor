@@ -296,6 +296,7 @@ class AudioTrack:
     offset: float = 0.0          # timeline seconds where the track starts
     duration: float = 0.0        # natural length; 0 means "use full input"
     src_start: float = 0.0       # source-file start in seconds (trim)
+    input_key: str | None = None
 
 
 @dataclass
@@ -326,6 +327,7 @@ class ExportJob:
     # Internal callers own these validated descriptors until the run is reaped.
     input_options: tuple[str, ...] = ()
     input_fds: dict[str, int] = field(default_factory=dict)
+    require_audio_input_fds: bool = False
 
     @property
     def total_timeline(self) -> float:
@@ -348,6 +350,7 @@ def added_audio_tracks(
             offset=audio.offset,
             duration=audio.src_span,
             src_start=audio.src_start,
+            input_key=f"audio:{audio.id}",
         )
         for audio in audios
     ]
@@ -929,7 +932,13 @@ class ExportWorker(QObject):
         add_track_indices: list[int] = []
         for track in job.audio_tracks:
             add_track_indices.append(len(clip_inputs) + len(add_track_indices))
-            cmd += [*job.input_options, "-i", str(track.path)]
+            if track.input_key in job.input_fds:
+                source = f"/dev/fd/{job.input_fds[track.input_key]}"
+            elif job.require_audio_input_fds:
+                raise RuntimeError("Missing validated audio descriptor.")
+            else:
+                source = str(track.path)
+            cmd += [*job.input_options, "-i", source]
 
         filter_complex, v_label, a_label = self._build_filtergraph(
             segments, clip_inputs, add_track_indices,
@@ -1151,6 +1160,8 @@ class ExportWorker(QObject):
                 mixed_extra = "extra_mix"
 
             if replace_any or a_out is None:
+                if replace_any and a_out is not None:
+                    parts.append(f"[{a_out}]anullsink")
                 a_out = mixed_extra
             else:
                 parts.append(

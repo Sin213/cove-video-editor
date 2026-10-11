@@ -133,6 +133,79 @@ def fake_probe(tmp_path, monkeypatch, body):
     script.chmod(0o700)
     monkeypatch.setattr(ap, "require_ffprobe", lambda: str(script))
     return script
+
+@pytest.mark.parametrize('suffix', ['.mp3', '.m4a', '.aac', '.wav', '.ogg', '.opus', '.flac'])
+def test_audio_formats_probe_held_descriptor(tree, suffix):
+    root, _, policy = tree; path = root / ('tone'+suffix)
+    subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'sine=duration=1',
+        '-y', str(path)], check=True, capture_output=True, timeout=15)
+    with ap.open_authorized_media(policy, str(path), kind='audio') as (fd, _, _):
+        result = ap.probe_fd(fd, kind='audio')
+        assert result['kind'] == 'audio' and 0.9 < result['duration_s'] < 1.2
+        assert result['audio_codec'] and result['container']
+
+def test_audio_probe_policy_and_cover_art(tree, tmp_path, monkeypatch):
+    doc = dict(streams=[dict(codec_type='audio', codec_name='mp3', nb_read_frames='10'),
+        dict(codec_type='video', codec_name='mjpeg', disposition=dict(attached_pic=1))],
+        format=dict(duration='3', format_name='mp3'))
+    record = tmp_path/'audio-argv.json'
+    fake_probe(tmp_path, monkeypatch, 'import sys,os,json\n'
+        + f'open({str(record)!r},"w").write(json.dumps([sys.argv,dict(os.environ),os.getcwd(),os.getpid(),os.getpgrp()]))\n'
+        + f'print({json.dumps(doc)!r})\n')
+    path = tree[0]/'cover.mp3'; path.touch()
+    with ap.open_authorized_media(tree[2], str(path), kind='audio') as (fd, _, _):
+        assert ap.probe_fd(fd, kind='audio')['duration_s'] == 3
+    args, env, cwd, pid, group = json.loads(record.read_text())
+    assert args[args.index('-i')+1].startswith('/dev/fd/')
+    assert args[args.index('-protocol_whitelist')+1] == 'file'
+    assert args[args.index('-format_whitelist')+1] == 'mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,mp3,wav,flac,ogg,aac'
+    assert set(env) <= {'PATH', 'LC_CTYPE'} and cwd == '/' and pid == group
+    assert '-count_frames' in args and '-read_intervals' in args
+
+def test_real_audio_cover_art_and_video_rejection(tree):
+    root, _, policy = tree
+    cover = root/'cover.png'
+    subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'color=red:s=32x32',
+        '-frames:v', '1', '-threads', '1', '-y', str(cover)], check=True, capture_output=True, timeout=15)
+    path = root/'covered.mp3'
+    subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'sine=frequency=550:duration=3',
+        '-i', str(cover), '-map', '0:a', '-map', '1:v', '-c:a', 'libmp3lame', '-c:v', 'mjpeg',
+        '-disposition:v', 'attached_pic', '-id3v2_version', '3', '-y', str(path)],
+        check=True, capture_output=True, timeout=15)
+    metadata = json.loads(subprocess.run(['ffprobe', '-v', 'error', '-show_streams', '-of', 'json',
+        str(path)], check=True, capture_output=True, timeout=15).stdout)
+    assert any(s['codec_type']=='video' and s['disposition']['attached_pic']==1 for s in metadata['streams'])
+    with ap.open_authorized_media(policy, str(path), kind='audio') as (fd, _, _):
+        result = ap.probe_fd(fd, kind='audio')
+    assert result['kind'] == 'audio' and result['audio_codec'] == 'mp3'
+    assert 3 <= result['duration_s'] < 3.2
+    movie = video(root/'movie.m4a', audio=True)
+    with ap.open_authorized_media(policy, str(movie), kind='audio') as (fd, _, _):
+        with rejected('UNSUPPORTED_MEDIA'): ap.probe_fd(fd, kind='audio')
+
+@pytest.mark.parametrize('change', ['zero', 'huge', 'nan', 'bad_codec', 'bad_format', 'no_frames', 'no_audio', 'video'])
+def test_invalid_audio_probe_metadata(tree, tmp_path, monkeypatch, change):
+    audio = dict(codec_type='audio', codec_name='pcm_s16le', nb_read_frames='20')
+    doc = dict(streams=[audio], format=dict(duration='3', format_name='wav'))
+    if change in {'zero', 'huge', 'nan'}: doc['format']['duration'] = {'zero': '0', 'huge': '86401', 'nan': 'nan'}[change]
+    elif change == 'bad_codec': audio['codec_name'] = 'evil:codec'
+    elif change == 'bad_format': doc['format']['format_name'] = 'evil:format'
+    elif change == 'no_frames': audio['nb_read_frames'] = '0'
+    elif change == 'no_audio': doc['streams'] = []
+    elif change == 'video': doc['streams'].append(dict(codec_type='video', codec_name='h264', disposition=dict(attached_pic=0)))
+    fake_probe(tmp_path, monkeypatch, f'print({json.dumps(doc)!r})\n')
+    path = tree[0]/'bad.wav'; path.touch()
+    with ap.open_authorized_media(tree[2], str(path), kind='audio') as (fd, _, _), pytest.raises(ap.AgentError):
+        ap.probe_fd(fd, kind='audio')
+
+def test_audio_symlink_swap_and_reap(tree, tmp_path, monkeypatch):
+    path = tree[0]/'race.wav'; path.touch(); outside = tmp_path/'outside.wav'; outside.touch()
+    def swap(stage):
+        if stage == 'before_open': path.unlink(); path.symlink_to(outside)
+    monkeypatch.setattr(ap, '_media_hook', swap)
+    before = len(os.listdir('/proc/self/fd'))
+    with rejected('PATH_NOT_AUTHORIZED'), ap.open_authorized_media(tree[2], str(path), kind='audio'): pass
+    assert len(os.listdir('/proc/self/fd')) == before
 def test_launch_policy(tree, tmp_path, monkeypatch):
     record = tmp_path / "argv.json"
     fake_probe(tmp_path, monkeypatch, "import sys,os,json\n"

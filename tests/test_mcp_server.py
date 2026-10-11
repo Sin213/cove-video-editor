@@ -152,7 +152,7 @@ def test_tools_and_workflow(tmp_path, transport):
                 tools = (await client.list_tools()).tools
                 names = {t.name for t in tools}
                 assert names == {"cove_" + n for n in ("get_capabilities", "inspect_media", "create_project",
-                    "import_media", "set_timeline", "get_project", "save_project", "start_export", "get_export_status", "cancel_export")}
+                    "import_media", "set_timeline", "get_project", "save_project", "start_export", "get_export_status", "cancel_export", "set_audio", "set_audio_mix")}
                 assert all(t.input_schema.get("additionalProperties") is False and t.output_schema for t in tools)
                 assert all(len(t.description) >= 80 for t in tools)
                 schemas = {t.name: t.input_schema for t in tools}
@@ -202,10 +202,30 @@ def test_tools_and_workflow(tmp_path, transport):
                 assert r.is_error and r.structured_content["error"]["code"] == "INVALID_ARGUMENT"
                 assert len(r.structured_content["error"]["message"]) <= 240 and len(r.content[0].text) <= 258 and "SECRET_INPUT" not in r.content[0].text
                 print("SDK error shapes:", json.dumps([r.model_dump(mode="json") for r in errors]))
+                from test_agent_editing import tones
+                music = tones(root / 'sdk-audio.wav')
+                summary = await call('set_audio', project_id=pid, items=[dict(path=str(music),volume=0.8,mute=True)])
+                assert summary['audio'][0]['volume'] == 0.8 and summary['audio'][0]['mute']
+                assert summary['audio'][0]['src_end_s'] == 4 and summary['audio'][0]['lane'] == 1
+                summary = await call('set_audio_mix', project_id=pid, original_gain=0.7, replace_original=True)
+                summary = await call('set_audio_mix', project_id=pid, added_gain=0.5)
+                assert summary['mix'] == dict(original_gain=0.7,added_gain=0.5,replace_original=True)
+                for tool, bad in [('set_audio',{'items':[{'path':str(music),'lane':True}]}),
+                    ('set_audio',{'items':[{'path':str(music),'src_end_s':None}]}),
+                    ('set_audio',{'items':[{'path':str(music),'volume':True}]}),
+                    ('set_audio',{'items':[{'path':str(music),'unknown':1}]}),
+                    ('set_audio',{'items':'[]'}), ('set_audio_mix',{}),
+                    ('set_audio_mix',{'added_gain':0.123}), ('set_audio_mix',{'added_gain':None}),
+                    ('set_audio_mix',{'replace_original':1}), ('set_audio_mix',{'unknown':1})]:
+                    r = await client.call_tool('cove_'+tool, dict(project_id=pid)|bad)
+                    assert r.is_error and r.structured_content['error']['code'] == 'INVALID_ARGUMENT'
+                    assert await call('get_project', project_id=pid) == summary
                 saved = await call("save_project", project_id=pid)
                 state = load_project(Path(saved["path"]))
                 assert (state.clips[0].src_start, state.clips[0].src_end, state.clips[0].speed,
                         state.clips[0].audio_volume, state.clips[0].muted) == (0.25, 2.5, 2, 0.4, True)
+                assert state.added_audios[0].volume == 0.8 and state.added_audios[0].muted
+                assert (state.original_gain,state.added_gain,state.replace_added_audio) == (0.7,0.5,True)
                 # Independent servers share the root while both connections are live.
                 async with connect() as second:
                     r = await second.call_tool("cove_create_project", {"name": "Stdio film"})
@@ -304,7 +324,7 @@ def test_sdk_stdio_export_audio_oracle(tmp_path):
         with anyio.fail_after(25):
             async with stdio_client(params) as streams, ClientSession(*streams, read_timeout_seconds=10) as client:
                 await client.initialize()
-                assert len((await client.list_tools()).tools) == 10
+                assert len((await client.list_tools()).tools) == 12
                 async def call(name, /, **args):
                     result = await client.call_tool('cove_' + name, args)
                     assert not result.is_error, result
@@ -469,6 +489,8 @@ def test_real_export_active_cancel_and_disconnect(tmp_path, mode):
     pytest.importorskip('mcp')
     root, out = tmp_path/'media', tmp_path/'out'; out.mkdir()
     paths = export_media(root, duration=30)
+    from test_agent_editing import tones
+    music = tones(root/'background.wav')
     client = ExportStdio(root, out, prepare=mode == 'prepare_eof')
     try:
         pid = client.call('create_project', name='Long render')['project_id']
@@ -477,6 +499,8 @@ def test_real_export_active_cancel_and_disconnect(tmp_path, mode):
         # Activity is proved by progress AND a live child, not assumed from length.
         client.call('set_timeline', project_id=pid, placement='sequential', clips=[
             dict(asset_id=aid,src_start_s=0,src_end_s=30,speed=0.25)])
+        client.call('set_audio', project_id=pid, items=[dict(path=str(music))])
+        client.call('set_audio_mix', project_id=pid, added_gain=0.5)
         client.call('save_project', project_id=pid)
         started = client.call('start_export', project_id=pid, output_name='long.mp4', resolution='1920x1080')
         child_pids = []
@@ -516,3 +540,102 @@ def test_real_export_active_cancel_and_disconnect(tmp_path, mode):
         assert not list(out.rglob('long.mp4')) and not list(out.rglob('.export-*'))
     finally:
         client.close()
+
+def test_stdio_audio_boundary_and_save_recovery(tmp_path):
+    pytest.importorskip('mcp')
+    from test_agent_editing import tones
+    root, out = tmp_path/'media', tmp_path/'out'; out.mkdir()
+    paths = export_media(root); music = tones(root/'music.wav')
+    client = ExportStdio(root, out)
+    try:
+        pid = client.call('create_project', name='Audio boundaries')['project_id']
+        aid = client.call('import_media', project_id=pid, paths=[str(paths[0])])['assets'][0]['asset_id']
+        clips = [dict(asset_id=aid, src_start_s=0, src_end_s=2.25)]
+        client.call('set_timeline', project_id=pid, placement='sequential', clips=clips)
+        client.call('set_audio', project_id=pid, items=[dict(path=str(music))])
+        client.call('save_project', project_id=pid)
+        before = client.call('get_project', project_id=pid)
+        result = client.request('tools/call', dict(name='cove_set_audio', arguments=dict(project_id=pid,
+            items=[dict(path=str(music), offset_s=86399.9995, src_end_s=0.0001)])))
+        assert result['isError'] and result['structuredContent']['error']['code']=='INVALID_TIMELINE'
+        assert client.call('get_project', project_id=pid)==before
+        valid = client.call('set_audio', project_id=pid, items=[dict(path=str(music), offset_s=86399.999, src_end_s=0.0001)])
+        assert valid['audio'][0]['timeline_end_s']==86400
+        summary = client.call('set_audio', project_id=pid, items=[dict(path=str(music), offset_s=5)])
+        files = {p.name:p.read_bytes() for p in out.rglob('*.coveproj')}
+        result = client.request('tools/call', dict(name='cove_save_project', arguments=dict(project_id=pid)))
+        assert result['isError'] and result['structuredContent']['error']['code']=='INVALID_TIMELINE'
+        assert 'cove_set_timeline' in result['structuredContent']['error']['message']
+        assert client.call('get_project', project_id=pid)==summary
+        assert files=={p.name:p.read_bytes() for p in out.rglob('*.coveproj')}
+        client.call('set_timeline', project_id=pid, placement='sequential', clips=clips*3)
+        client.call('save_project', project_id=pid)
+        assert client.call('get_project', project_id=pid)['saved_is_current']
+    finally:
+        client.close()
+
+def test_sdk_stdio_background_audio_snapshot(tmp_path):
+    pytest.importorskip('mcp')
+    import anyio
+    from mcp.client.session import ClientSession
+    from mcp.client.stdio import StdioServerParameters, stdio_client
+    from test_agent_editing import tones, pcm, amplitude
+    root, out = tmp_path/'media', tmp_path/'out'; out.mkdir()
+    paths = export_media(root); music = tones(root/'music.wav')
+    release, entered = tmp_path/'release', tmp_path/'entered'
+    code = ('from pathlib import Path\nimport time\n'
+        'from cove_video_editor import agent_exports as ae\n'
+        'from cove_video_editor.mcp_server import main\n'
+        'def hold(stage,job):\n'
+        ' if stage=="before_run":\n'
+        f'  Path({str(entered)!r}).touch()\n'
+        f'  while not Path({str(release)!r}).exists() and not job.cancel_requested: time.sleep(0.01)\n'
+        'ae._hook=hold\nraise SystemExit(main())')
+    async def run():
+        params = StdioServerParameters(command=sys.executable, args=['-c', code,
+            '--media-root', str(root), '--output-root', str(out)], env=dict(os.environ))
+        with anyio.fail_after(30):
+            async with stdio_client(params) as streams, ClientSession(*streams, read_timeout_seconds=10) as client:
+                await client.initialize()
+                tools = (await client.list_tools()).tools
+                assert len(tools) == 12
+                schemas = {t.name:t.input_schema for t in tools}
+                fields = schemas['cove_set_audio']['$defs']['AudioItem']['properties']
+                assert all(fields[n].get('description') for n in fields)
+                async def call(name, /, **args):
+                    result = await client.call_tool('cove_'+name, args)
+                    assert not result.is_error, result
+                    return result.structured_content
+                await call('inspect_media', paths=[str(paths[0])])
+                pid = (await call('create_project', name='Audio snapshot'))['project_id']
+                aid = (await call('import_media', project_id=pid, paths=[str(paths[0])]))['assets'][0]['asset_id']
+                await call('set_timeline', project_id=pid, placement='sequential', clips=[dict(asset_id=aid,src_start_s=0,src_end_s=2.25)])
+                await call('set_audio', project_id=pid, items=[dict(path=str(music),src_start_s=2,offset_s=0.5,volume=0.8,lane=7)])
+                await call('set_audio_mix', project_id=pid, added_gain=0.5, replace_original=True)
+                summary = await call('get_project', project_id=pid)
+                assert summary['audio'][0]['lane'] == 7 and summary['mix']['added_gain'] == 0.5
+                for bad in ({'items':[{'path':str(music),'unknown':True}]}, {'items':'[]'}, {'items':[{'path':str(music),'lane':True}]}):
+                    error = await client.call_tool('cove_set_audio', dict(project_id=pid)|bad)
+                    assert error.is_error and error.structured_content['error']['code'] == 'INVALID_ARGUMENT'
+                for bad in ({}, {'added_gain':0.123}, {'replace_original':1}):
+                    error = await client.call_tool('cove_set_audio_mix', dict(project_id=pid)|bad)
+                    assert error.is_error and error.structured_content['error']['code'] == 'INVALID_ARGUMENT'
+                assert await call('get_project', project_id=pid) == summary
+                saved = await call('save_project', project_id=pid)
+                started = await call('start_export', project_id=pid, output_name='snapshot.mp4')
+                try:
+                    while not entered.exists(): await anyio.sleep(0.01)
+                    await call('set_audio', project_id=pid, items=[])
+                    await call('set_audio_mix', project_id=pid, added_gain=3, replace_original=False)
+                finally: release.touch()
+                while True:
+                    status = await call('get_export_status', job_id=started['job_id'])
+                    if status['state'] in {'SUCCEEDED','FAILED','CANCELLED'}: break
+                    await anyio.sleep(0.01)
+                assert status['state'] == 'SUCCEEDED', status
+                assert status['saved_revision'] == saved['revision']
+                samples = pcm(status['output']['path'])
+                assert 1400 < amplitude(samples,880) < 1900
+                assert amplitude(samples,440) < 30 and amplitude(samples,660) < 30
+                assert amplitude(samples,880,0.1,0.3) < 20
+    anyio.run(run)

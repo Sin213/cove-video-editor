@@ -99,8 +99,10 @@ class ExportManager:
                 raise ap.AgentError("EXPORT_BUSY", f"Export {self.active.job_id} is active; poll or cancel that job_id before starting another.")
             render = ex.build_export_job(copy.deepcopy(p.state), output="render.mp4",
                 fmt_key="MP4 (H.264 + AAC)", size=RESOLUTIONS[resolution], encoder_pref=encoder)
+            render.require_audio_input_fds = True
             job = Export(uuid.uuid4().hex, project_id, p.saved["revision"], p.saved["sha256"],
-                render, dict(p.identities), p.fd, Path(self.session.policy.output_root) / p.dirname, output_name)
+                render, {**p.identities, **{f"audio:{aid}": identity for aid, identity in p.audio_identities.items()}},
+                p.fd, Path(self.session.policy.output_root) / p.dirname, output_name)
             self.jobs[job.job_id] = job
             self.active = job
             job.owner = threading.Thread(target=self._run, args=(job,), name="cove-export-owner")
@@ -172,7 +174,8 @@ class ExportManager:
         if job.state != "PUBLISHING":
             for aid, fd in job.render.input_fds.items():
                 if ap.file_identity(os.fstat(fd)) != job.identities[aid]:
-                    raise ap.AgentError("ASSET_CHANGED", "Media changed in place during export; re-import and re-save in a fresh project.")
+                    recovery = "call cove_set_audio again, then save" if aid.startswith("audio:") else "re-import and re-save in a fresh project"
+                    raise ap.AgentError("ASSET_CHANGED", f"{aid}: Media changed in place during export; {recovery}.")
 
     def _run(self, job):
         workspace = ".export-" + uuid.uuid4().hex
@@ -190,7 +193,16 @@ class ExportManager:
                     if identity != job.identities[c.asset.id]:
                         raise ap.AgentError("ASSET_CHANGED", "Media was replaced; re-import and re-save in a fresh project.")
                     job.render.input_fds[c.asset.id] = fd
-                job.render.input_options = ap.INPUT_OPTIONS
+                for i, track in enumerate(job.render.audio_tracks):
+                    try:
+                        fd, _, identity = inputs.enter_context(ap.open_authorized_media(
+                            self.session.policy, str(track.path), kind="audio"))
+                        if identity != job.identities.get(track.input_key):
+                            raise OSError()
+                    except (ap.AgentError, OSError):
+                        raise ap.AgentError("ASSET_CHANGED", f"audio[{i}] {track.input_key} {str(track.path)[:70]!r}: changed or unavailable; call cove_set_audio again, then save.") from None
+                    job.render.input_fds[track.input_key] = fd
+                job.render.input_options = ap.AUDIO_INPUT_OPTIONS if job.render.audio_tracks else ap.INPUT_OPTIONS
                 # LIFO callbacks run before the held input descriptors close.
                 inputs.callback(self._check_inputs, job)
                 inputs.callback(self._reap, job)
