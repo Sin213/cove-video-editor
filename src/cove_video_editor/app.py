@@ -2354,7 +2354,8 @@ class MainWindow(QMainWindow):
             # still try sites/formats that do not need a merge step.
             ffmpeg_path = None
 
-        dlg = DownloadVideoDialog(self, ffmpeg_path=ffmpeg_path)
+        dlg = DownloadVideoDialog(self, ffmpeg_path=ffmpeg_path,
+                                  settings=QSettings(SETTINGS_ORG, SETTINGS_APP))
         dlg.downloadFinished.connect(self._on_download_video_finished)
 
         def _clear_dialog(_result: int) -> None:
