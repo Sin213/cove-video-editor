@@ -10,11 +10,15 @@ MAX_PATHS, MAX_PATH_CHARS, MAX_NAME, MAX_PROJECTS = 50, 4096, 80, 20
 MAX_ASSETS, MAX_CLIPS, MAX_TIMELINE, MAX_WARNINGS = 200, 200, 86400, 50
 PROBE_TIMEOUT, PROBE_BUDGET, PROBE_OUTPUT_CAP = 10, 60, 65536
 EXTENSIONS = frozenset({".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"})
+INPUT_OPTIONS = ("-protocol_whitelist", "file", "-format_whitelist",
+                 "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi")
 ERROR_CODES = frozenset("INVALID_ARGUMENT NOT_CONFIGURED PATH_NOT_AUTHORIZED FILE_NOT_FOUND "
     "NOT_A_REGULAR_FILE UNSUPPORTED_EXTENSION UNSUPPORTED_MEDIA PROBE_TIMEOUT PROBE_FAILED "
     "PROBE_OUTPUT_TOO_LARGE PROBE_BUDGET_EXCEEDED LIMIT_EXCEEDED UNKNOWN_PROJECT UNKNOWN_ASSET "
     "ASSET_NOT_VIDEO INVALID_TIMELINE EMPTY_TIMELINE ASSET_CHANGED DESTINATION_EXISTS "
-    "OUTPUT_FILESYSTEM_UNSUPPORTED OUTPUT_UNSAFE PROJECT_CHANGED_ON_DISK INTERNAL_ERROR".split())
+    "OUTPUT_FILESYSTEM_UNSUPPORTED OUTPUT_UNSAFE PROJECT_CHANGED_ON_DISK INTERNAL_ERROR "
+    "EXPORT_BUSY PROJECT_NOT_SAVED UNKNOWN_EXPORT EXPORT_FAILED EXPORT_TIMEOUT "
+    "EXPORT_OUTPUT_INVALID SHUTTING_DOWN".split())
 LIMITS = dict(paths=MAX_PATHS, path_chars=MAX_PATH_CHARS, name_chars=MAX_NAME,
     projects=MAX_PROJECTS, assets=MAX_ASSETS, clips=MAX_CLIPS, timeline_s=MAX_TIMELINE,
     probe_timeout_s=PROBE_TIMEOUT, probe_budget_s=PROBE_BUDGET,
@@ -103,8 +107,7 @@ def probe_fd(fd: int, *, timeout: float = PROBE_TIMEOUT) -> dict:
     except FFmpegMissingError:
         raise AgentError("PROBE_FAILED", "ffprobe is unavailable. Install FFmpeg (ffprobe).") from None
     # Probe the held fd with whitelists: rejecting metadata afterward is not access control.
-    cmd = [binary, "-v", "error", "-protocol_whitelist", "file",
-        "-format_whitelist", "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi",
+    cmd = [binary, "-v", "error", *INPUT_OPTIONS,
         "-show_entries", "stream=codec_type,codec_name,width,height,r_frame_rate:format=duration,format_name",
         "-of", "json", "-i", f"/dev/fd/{fd}"]
     try:
@@ -181,6 +184,17 @@ def create_project_dir(policy: PathPolicy, name: str) -> int:
         raise AgentError("OUTPUT_UNSAFE", "Cannot create an exclusive project directory.") from None
 def _publish_hook() -> None:
     """Seam between complete temporary write and no-clobber publication."""
+def link_output(fd: int, dir_fd: int, final: str) -> None:
+    """Publish the held inode without replacing any existing name."""
+    try:
+        os.link(f"/proc/self/fd/{fd}", final, dst_dir_fd=dir_fd, follow_symlinks=True)
+        os.fsync(dir_fd)
+    except OSError as exc:
+        code = "DESTINATION_EXISTS" if exc.errno == errno.EEXIST else (
+            "OUTPUT_FILESYSTEM_UNSUPPORTED" if exc.errno in {
+                errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EXDEV, errno.EMLINK, errno.ENOSYS, errno.EINVAL, errno.ENOENT}
+            else "OUTPUT_UNSAFE")
+        raise AgentError(code, "Output root must support hard links; restart with another --output-root (unsaved edits are lost)." if code == "OUTPUT_FILESYSTEM_UNSUPPORTED" else ("Destination already exists; it will not be overwritten." if code == "DESTINATION_EXISTS" else "Output could not be published safely.")) from None
 def publish(dir_fd: int, final: str, doc: dict) -> tuple[str, int]:
     temp = ".tmp-" + uuid.uuid4().hex
     owned, fd, private_fd, owned_dir = None, None, None, None
@@ -208,8 +222,7 @@ def publish(dir_fd: int, final: str, doc: dict) -> tuple[str, int]:
             raise AgentError("OUTPUT_UNSAFE", "Temporary project exceeds 16 MiB.")
         _publish_hook()
         # Publish our held inode even if another writer replaces the temp name.
-        os.link(f"/proc/self/fd/{fd}", final, dst_dir_fd=dir_fd, follow_symlinks=True)
-        os.fsync(dir_fd)
+        link_output(fd, dir_fd, final)
         return hashlib.sha256(data).hexdigest(), len(data)
     except OSError as exc:
         code = "DESTINATION_EXISTS" if exc.errno == errno.EEXIST else (

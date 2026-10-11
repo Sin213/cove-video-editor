@@ -47,18 +47,31 @@ class AgentSession:
         self.policy = policy
         self.lock = threading.RLock()
         self.projects: dict[str, Project] = {}
+        self.closing = False
+        from .agent_exports import ExportManager
+        self.exports = ExportManager(self)
     def close(self) -> None:
+        self.shutdown_exports()
         with self.lock:
             for p in self.projects.values():
                 os.close(p.fd)
             self.projects.clear()
             self.policy.close()
+    def shutdown_exports(self) -> None:
+        self.exports.shutdown()
+    def start_export(self, project_id, output_name, format="mp4", resolution="source", encoder="cpu") -> dict:
+        return self.exports.start(project_id, output_name, format, resolution, encoder)
+    def get_export_status(self, job_id) -> dict:
+        return self.exports.status(job_id)
+    def cancel_export(self, job_id) -> dict:
+        return self.exports.cancel(job_id)
     def capabilities(self) -> dict:
         return dict(operations=["cove_" + s for s in ("get_capabilities", "inspect_media", "create_project",
-            "import_media", "set_timeline", "get_project", "save_project")], media_kinds=["video"],
+            "import_media", "set_timeline", "get_project", "save_project", "start_export",
+            "get_export_status", "cancel_export")], media_kinds=["video"],
             extensions=sorted(ap.EXTENSIONS), media_roots=list(self.policy.media_roots),
             output_root=self.policy.output_root, limits=ap.LIMITS, save_policy="immutable revisions",
-            publication="descriptor-relative hard link", export={"available": False, "reason": "not in this release"})
+            publication="descriptor-relative hard link", export=self.exports.capabilities())
     def _project(self, pid: str) -> Project:
         if type(pid) is not str or len(pid) > 80:
             raise ap.AgentError("INVALID_ARGUMENT", "Use an opaque project id.")
@@ -211,37 +224,42 @@ class AgentSession:
                 saved_path=saved.get("path"), saved_sha256=saved.get("sha256"),
                 saved_is_current=saved.get("revision") == p.revision, assets=[_asset(a) for a in p.state.assets],
                 clips=clips, duration_s=cursor, warnings=warnings)
+    def _verify_project(self, p: Project) -> None:
+        """Shared admission/save checks, including the digest of a current save."""
+        try:
+            st = os.stat(p.dirname, dir_fd=self.policy.output_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(st.st_mode) or ap.file_identity(st)[:2] != ap.file_identity(os.fstat(p.fd))[:2]:
+                raise OSError()
+        except OSError:
+            raise ap.AgentError("OUTPUT_UNSAFE", "Project directory was replaced.") from None
+        for a in p.state.assets:
+            try:
+                with ap.open_authorized_media(self.policy, str(a.path)) as (_, _, identity):
+                    if identity != p.identities[a.id]:
+                        raise OSError()
+            except (ap.AgentError, OSError):
+                raise ap.AgentError("ASSET_CHANGED", f"asset_id {a.id}: Media changed or is unavailable; re-import and re-save in a fresh project.") from None
+        if p.saved and p.saved["revision"] == p.revision:
+            final = f"{p.slug}.r{p.revision:04d}.coveproj"
+            try:
+                fd = os.open(final, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=p.fd)
+                with os.fdopen(fd, "rb") as stream:
+                    st = os.fstat(stream.fileno())
+                    if not stat.S_ISREG(st.st_mode) or st.st_size != p.saved["size_bytes"]:
+                        raise OSError()
+                    digest = hashlib.sha256(stream.read(p.saved["size_bytes"] + 1)).hexdigest()
+                if digest != p.saved["sha256"]:
+                    raise OSError()
+            except OSError:
+                raise ap.AgentError("PROJECT_CHANGED_ON_DISK", "Saved revision changed; it will not be rewritten.") from None
     def save_project(self, project_id: str) -> dict:
         with self.lock:
             p = self._project(project_id)
             if not p.state.clips:
                 raise ap.AgentError("EMPTY_TIMELINE", "Place at least one clip before saving.")
-            try:
-                st = os.stat(p.dirname, dir_fd=self.policy.output_fd, follow_symlinks=False)
-                if not stat.S_ISDIR(st.st_mode) or ap.file_identity(st)[:2] != ap.file_identity(os.fstat(p.fd))[:2]:
-                    raise OSError()
-            except OSError:
-                raise ap.AgentError("OUTPUT_UNSAFE", "Project directory was replaced.") from None
-            for a in p.state.assets:
-                try:
-                    with ap.open_authorized_media(self.policy, str(a.path)) as (_, _, identity):
-                        if identity != p.identities[a.id]:
-                            raise ap.AgentError("ASSET_CHANGED", "Imported media changed.")
-                except (ap.AgentError, OSError):
-                    raise ap.AgentError("ASSET_CHANGED", f"asset_id {a.id}: Imported media changed or is unavailable.") from None
+            self._verify_project(p)
             final = f"{p.slug}.r{p.revision:04d}.coveproj"
             if p.saved and p.saved["revision"] == p.revision:
-                try:
-                    fd = os.open(final, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=p.fd)
-                    with os.fdopen(fd, "rb") as stream:
-                        st = os.fstat(stream.fileno())
-                        if not stat.S_ISREG(st.st_mode) or st.st_size != p.saved["size_bytes"]:
-                            raise OSError()
-                        digest = hashlib.sha256(stream.read(p.saved["size_bytes"] + 1)).hexdigest()
-                    if digest != p.saved["sha256"]:
-                        raise OSError()
-                except OSError:
-                    raise ap.AgentError("PROJECT_CHANGED_ON_DISK", "Saved revision changed; it will not be rewritten.") from None
                 return dict(p.saved)
             digest, size = ap.publish(p.fd, final, serialize_project(p.state))
             p.saved = dict(path=str(Path(self.policy.output_root) / p.dirname / final), revision=p.revision,

@@ -323,6 +323,9 @@ class ExportJob:
     # works, else CPU), "cpu", "nvenc" or "amf". Callers that predate the
     # setting - and every audio-only job - keep the safe default.
     encoder_pref: str = "auto"
+    # Internal callers own these validated descriptors until the run is reaped.
+    input_options: tuple[str, ...] = ()
+    input_fds: dict[str, int] = field(default_factory=dict)
 
     @property
     def total_timeline(self) -> float:
@@ -457,6 +460,12 @@ class ExportWorker(QObject):
                     self._cancel_claimed = True
                 return
             self._claim_if_live(proc)
+
+    def kill(self) -> None:
+        """Escalate only against this worker's live child; preserve ownership."""
+        with self._proc_lock:
+            if self._proc is not None and self._proc.poll() is None:
+                self._proc.kill()
 
     def _claim_if_live(self, proc: subprocess.Popen) -> None:
         """Take ownership of the run only if the child is still running.
@@ -909,17 +918,18 @@ class ExportWorker(QObject):
                     "-loop", "1",
                     "-framerate", "30",
                     "-t", f"{img_dur:.3f}",
-                    "-i", str(c.path),
+                    *job.input_options, "-i", str(c.path),
                 ]
             else:
-                cmd += ["-i", str(c.path)]
+                source = f"/dev/fd/{job.input_fds[c.asset.id]}" if c.asset.id in job.input_fds else str(c.path)
+                cmd += [*job.input_options, "-i", source]
 
         # One -i per added-audio track. Parallel list of ffmpeg input indices
         # so the filter graph can reference them.
         add_track_indices: list[int] = []
         for track in job.audio_tracks:
             add_track_indices.append(len(clip_inputs) + len(add_track_indices))
-            cmd += ["-i", str(track.path)]
+            cmd += [*job.input_options, "-i", str(track.path)]
 
         filter_complex, v_label, a_label = self._build_filtergraph(
             segments, clip_inputs, add_track_indices,
@@ -1201,6 +1211,7 @@ class ExportWorker(QObject):
                 stdin=subprocess.DEVNULL,
                 text=True,
                 bufsize=1,
+                **({"pass_fds": tuple(sorted(set(job.input_fds.values())))} if job.input_fds else {}),
                 **_POPEN_KWARGS,
             )
         except BaseException:
