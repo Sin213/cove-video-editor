@@ -27,13 +27,58 @@ Set-StrictMode -Version Latest
 $App        = "cove-video-editor"
 $ReleaseDir = "release"
 $FfmpegUrl  = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
-$YtDlpUrl   = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+$YtDlpPins  = Join-Path $PSScriptRoot "packaging/yt-dlp-pins.json"
 
 function Step([string]$msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 
 function Download-File([string]$url, [string]$dest) {
     & curl.exe --silent --show-error --fail --location --output $dest $url
     if ($LASTEXITCODE -ne 0) { throw "Download failed: $url" }
+}
+
+function Download-PinnedYtDlp([string]$dest) {
+    $tmp = $dest + ".tmp." + [Guid]::NewGuid()
+    $actual = "unavailable"
+    $expected = "unavailable"
+    try {
+        try {
+            $pin = Get-Content -LiteralPath $YtDlpPins -Raw | ConvertFrom-Json
+            $asset = $pin.assets.'windows-x86_64'
+            if (($pin.schema -isnot [int] -and $pin.schema -isnot [long]) -or $pin.schema -ne 1 -or
+                $pin.tag -isnot [string] -or $pin.tag -cnotmatch '^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\z' -or
+                $asset.name -isnot [string] -or $asset.name -cnotmatch '^[A-Za-z0-9._-]+\z' -or
+                $asset.sha256 -isnot [string] -or $asset.sha256 -cnotmatch '^[0-9a-f]{64}\z') {
+                throw "Invalid schema, tag, asset name or sha256"
+            }
+        } catch { throw "yt-dlp pin manifest invalid or unavailable: $($_.Exception.Message)" }
+        $expected = $asset.sha256
+        if (Test-Path -LiteralPath $dest -PathType Leaf) {
+            $actual = (Get-FileHash -LiteralPath $dest -Algorithm SHA256).Hash
+            if ($actual -ieq $expected) {
+                Write-Host "cached yt-dlp verified"
+                Write-Host "yt-dlp $($pin.tag) $($asset.name) sha256 $expected verified"
+                return
+            }
+            Write-Host "yt-dlp cache mismatch: expected $expected actual $actual; replacing"
+        }
+        if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Force }
+        $url = "https://github.com/yt-dlp/yt-dlp/releases/download/$($pin.tag)/$($asset.name)"
+        & curl.exe --fail --location --retry 3 --max-time 300 --silent --show-error --output $tmp $url
+        $curlStatus = $LASTEXITCODE
+        $actual = "unavailable"
+        if (Test-Path -LiteralPath $tmp -PathType Leaf) {
+            $actual = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash
+        }
+        if ($curlStatus -ne 0) { throw "yt-dlp download failed: expected $expected actual $actual" }
+        if ($actual -ine $expected) { throw "yt-dlp checksum mismatch: expected $expected actual $actual" }
+        Move-Item -LiteralPath $tmp -Destination $dest -Force
+        Write-Host "yt-dlp $($pin.tag) $($asset.name) sha256 $expected verified"
+    } catch {
+        if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Force }
+        throw
+    } finally {
+        if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force }
+    }
 }
 
 Step "Building $App v$Version"
@@ -80,8 +125,7 @@ if (-not (Test-Path $ffprobeExe)) { throw "ffprobe.exe missing from downloaded a
 
 Step "[3/7] Downloading yt-dlp"
 $ytDlpExe = Join-Path $ffTmp "yt-dlp.exe"
-Download-File $YtDlpUrl $ytDlpExe
-if (-not (Test-Path $ytDlpExe)) { throw "yt-dlp.exe missing after download" }
+Download-PinnedYtDlp $ytDlpExe
 
 # --- 4. PyInstaller: one-dir (installer input) --------------------------------
 

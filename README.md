@@ -54,6 +54,10 @@ artifacts via GitHub Actions.
   download dialog. Paste a URL, pick a destination, and the file is
   downloaded via `yt-dlp` and dropped straight onto the timeline at the
   playhead. No detour through the OS file manager.
+  Builds bundle yt-dlp 2026.08.19 with SHA-256 verification (Linux x86_64 and
+  Windows x86_64). Automatic selection is the default; Custom executable lets
+  you choose a trusted local yt-dlp, verified before download with its version
+  and source shown in the dialog.
 - **Editor-friendly MP4 preference** — the downloader prefers H.264 video
   with AAC audio in an MP4 container so the result imports cleanly into
   the editor without re-encoding.

@@ -57,6 +57,8 @@ QUALITY_FORMATS = {
 }
 
 AUTH_MODES = ("None", "Browser cookies", "Cookie file")
+YT_DLP_MODES = ("Automatic", "Custom executable")
+YT_DLP_INFO_NEUTRAL = "yt-dlp: version shown when a download starts"
 SUPPORTED_BROWSERS = ("brave", "chrome", "chromium", "edge", "firefox", "opera", "safari", "vivaldi", "whale")
 CONFIG_NOTE = "External yt-dlp configuration is ignored (--ignore-config)."
 
@@ -221,6 +223,7 @@ def failure_summary(category: str) -> str:
         "VIDEO_UNAVAILABLE": "This video is unavailable to this request.",
         "NETWORK_ERROR": "The download encountered a network error.\nCheck your connection and try again.",
         "YT_DLP_MISSING": "yt-dlp is required to download videos. Install yt-dlp and try again.",
+        "YT_DLP_UNVERIFIED": "The selected yt-dlp could not be verified. Choose another executable or switch to Automatic.",
         "FFMPEG_ERROR": "The video could not be processed.\nCheck that ffmpeg is available; see Details.",
     }.get(category, "The download failed. See Details for the yt-dlp diagnostic.")
 
@@ -232,6 +235,32 @@ def _popen_options(os_name: str) -> dict:
 class DownloadTool(NamedTuple):
     command: list[str]
     source: str
+
+
+def custom_yt_dlp_tool(value: str) -> DownloadTool:
+    if not isinstance(value, str) or not value.strip():
+        raise DownloadInputError("Choose a custom yt-dlp executable.")
+    if (len(value) > 4096 or re.search(r"[\x00-\x1f\x7f-\x9f]", value)
+            or re.match(r"[A-Za-z][A-Za-z0-9+.-]*://", value.strip())):
+        raise DownloadInputError("Choose a local yt-dlp executable with a valid path.")
+    try:
+        path = Path(value).expanduser().absolute()
+        if not path.exists():
+            raise DownloadInputError("The selected yt-dlp executable does not exist.")
+        if not path.is_file():
+            raise DownloadInputError("Choose a regular yt-dlp executable file.")
+        if sys.executable and path.samefile(sys.executable):
+            raise DownloadInputError("Choose yt-dlp rather than Cove or its Python interpreter.")
+        if os.name == "nt":
+            if path.suffix.lower() != ".exe":
+                raise DownloadInputError("Choose a yt-dlp .exe file.")
+        elif not os.access(path, os.X_OK):
+            raise DownloadInputError("The selected yt-dlp file is not executable.")
+    except (OSError, RuntimeError, ValueError) as exc:
+        if isinstance(exc, DownloadInputError):
+            raise
+        raise DownloadInputError("The selected yt-dlp executable could not be accessed.") from None
+    return DownloadTool([str(path)], "custom")
 
 
 def _yt_dlp_command() -> DownloadTool | None:
@@ -267,6 +296,7 @@ class DownloadWorker(QObject):
     failed = Signal(str)
     cancelled = Signal()
     details = Signal(str)
+    tool_info = Signal(str)
 
     def __init__(
         self,
@@ -276,6 +306,7 @@ class DownloadWorker(QObject):
         ffmpeg_path: str | None = None,
         *, auth_mode: str = "None", browser: str = "",
         browser_profile: str = "", cookie_file: str = "", extra_literals=(),
+        yt_dlp_mode: str = "Automatic", yt_dlp_path: str = "",
     ) -> None:
         super().__init__()
         self._url = url
@@ -286,6 +317,7 @@ class DownloadWorker(QObject):
                           browser_profile=browser_profile, cookie_file=cookie_file)
         self._cookie_file_input = cookie_file
         self._extra_literals = tuple(extra_literals)
+        self._yt_dlp_mode, self._yt_dlp_path = yt_dlp_mode, yt_dlp_path
         self._proc: subprocess.Popen[str] | None = None
         self._cancelled = False
         self._termination_requested = False
@@ -299,32 +331,37 @@ class DownloadWorker(QObject):
                         self._extra_literals[0] if self._extra_literals else ""),
                         browser_profile=self._auth["browser_profile"], extra_literals=self._extra_literals)
 
-    def _version_details(self, tool: DownloadTool, env: dict) -> None:
-        version = "unknown"
+    def _version_details(self, tool: DownloadTool, env: dict) -> str | None:
+        version = None
         reason = ""
         try:
             proc = self._start_process([*tool.command, "--ignore-config", "--version"],
                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                       encoding="utf-8", errors="replace", env=env, **_popen_options(os.name))
             output, _ = proc.communicate(timeout=10)
-            if proc.returncode == 0 and output.strip():
-                version = output.strip()
+            candidate = output.strip()
+            if (proc.returncode == 0 and len(candidate) <= 64
+                    and re.fullmatch(r"\d{4}\.\d{1,2}\.\d{1,2}\S*", candidate)):
+                version = candidate
             else:
                 reason = f"Version probe exited with status {proc.returncode}."
         except subprocess.TimeoutExpired:
             if self._proc is not None:
                 self._kill_cancelled_process(self._proc)
             reason = "Version probe timed out."
-        except Exception as exc:  # A diagnostic failure must not block downloading.
+        except Exception as exc:  # Automatic downloads remain non-gating.
             reason = self._safe(f"Version probe failed: {exc}")
         finally:
             self._finish_cancelled_process()
             with self._process_lock:
                 self._proc = None
-        lines = [f"yt-dlp {version} ({tool.source})", CONFIG_NOTE, f"Executable: {tool.command[0]}"]
+        info = self._safe(f"yt-dlp {version or 'unknown'} ({tool.source})")
+        self.tool_info.emit(info)
+        lines = [info, CONFIG_NOTE, f"Executable: {tool.command[0]}"]
         if reason:
             lines.append(reason)
         self.details.emit(self._safe("\n".join(lines)))
+        return version
 
     def _start_process(self, command: list[str], **options) -> subprocess.Popen:
         proc = subprocess.Popen(command, **options)
@@ -341,7 +378,10 @@ class DownloadWorker(QObject):
         try:
             if self._cancelled:
                 return
-            tool = _yt_dlp_command()
+            if self._yt_dlp_mode not in YT_DLP_MODES:
+                raise DownloadInputError("Choose a valid yt-dlp executable mode.")
+            tool = (custom_yt_dlp_tool(self._yt_dlp_path)
+                    if self._yt_dlp_mode == "Custom executable" else _yt_dlp_command())
             if tool is None:
                 value = failure_summary("YT_DLP_MISSING")
                 self.details.emit(f"yt-dlp unknown (not found)\n{CONFIG_NOTE}")
@@ -355,8 +395,11 @@ class DownloadWorker(QObject):
             self._output_folder.mkdir(parents=True, exist_ok=True)
             env = os.environ.copy()
             env.update(PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
-            self._version_details(tool, env)  # Runs only on this worker thread.
+            version = self._version_details(tool, env)  # Runs only on this worker thread.
             if self._cancelled:
+                return
+            if self._yt_dlp_mode == "Custom executable" and version is None:
+                value = failure_summary("YT_DLP_UNVERIFIED")
                 return
             self.status.emit("Starting download...")
             self._start_process(
@@ -578,6 +621,32 @@ class DownloadVideoDialog(QDialog):
         folder_row.addWidget(self.folder_edit, stretch=1)
         folder_row.addWidget(self.folder_btn)
         form.addRow("Output folder", folder_row)
+        self.yt_dlp_combo = QComboBox()
+        self.yt_dlp_combo.addItems(YT_DLP_MODES)
+        self.yt_dlp_combo.setAccessibleName("yt-dlp executable mode")
+        form.addRow("yt-dlp", self.yt_dlp_combo)
+        self.yt_dlp_edit = QLineEdit()
+        self.yt_dlp_edit.setPlaceholderText("Path to your yt-dlp executable")
+        self.yt_dlp_edit.setAccessibleName("Custom yt-dlp executable path")
+        self.yt_dlp_btn = QPushButton("Choose...")
+        self.yt_dlp_btn.setAccessibleName("Choose yt-dlp executable")
+        self.yt_dlp_btn.clicked.connect(self._choose_yt_dlp)
+        self.yt_dlp_label = QLabel("Executable")
+        self.yt_dlp_label.setBuddy(self.yt_dlp_edit)
+        tool_row = QHBoxLayout()
+        tool_row.addWidget(self.yt_dlp_edit, stretch=1)
+        tool_row.addWidget(self.yt_dlp_btn)
+        form.addRow(self.yt_dlp_label, tool_row)
+        self.yt_dlp_hint = QLabel()
+        self.yt_dlp_hint.setWordWrap(True)
+        form.addRow(self.yt_dlp_hint)
+        self.yt_dlp_info = QLabel(YT_DLP_INFO_NEUTRAL)
+        self.yt_dlp_info.setWordWrap(True)
+        form.addRow(self.yt_dlp_info)
+        self._restore_yt_dlp()
+        self.yt_dlp_combo.currentIndexChanged.connect(self._yt_dlp_changed)
+        self.yt_dlp_edit.textChanged.connect(self._reset_yt_dlp_info)
+        self._yt_dlp_changed()
         self.auth_combo = QComboBox()
         self.auth_combo.addItems(AUTH_MODES)
         self.auth_combo.setAccessibleName("Sign-in mode")
@@ -648,6 +717,43 @@ class DownloadVideoDialog(QDialog):
         btn_row.addWidget(self.cancel_btn)
         btn_row.addWidget(self.download_btn)
         root.addLayout(btn_row)
+
+    def _restore_yt_dlp(self) -> None:
+        if self._settings is None:
+            return
+        try:
+            mode = self._settings.value("downloader/yt_dlp_mode", "Automatic")
+            path = self._settings.value("downloader/yt_dlp_path", "")
+            if (not isinstance(mode, str) or not isinstance(path, str) or mode not in YT_DLP_MODES
+                    or len(path) > 4096 or re.search(r"[\x00-\x1f\x7f-\x9f]", path)):
+                return
+            self.yt_dlp_combo.setCurrentText(mode)
+            self.yt_dlp_edit.setText(path)
+        except Exception:
+            pass  # Malformed preferences leave Automatic/empty defaults.
+
+    def _yt_dlp_changed(self) -> None:
+        self._reset_yt_dlp_info()
+        custom = self.yt_dlp_combo.currentText() == "Custom executable"
+        enabled = not hasattr(self, "download_btn") or self.download_btn.isEnabled()
+        for widget in (self.yt_dlp_label, self.yt_dlp_edit, self.yt_dlp_btn):
+            widget.setVisible(custom)
+            widget.setEnabled(custom and enabled)
+        self.yt_dlp_hint.setText(
+            "Cove will run this program with your permissions. Only choose a yt-dlp you trust." if custom else
+            "Uses the yt-dlp bundled with Cove, or one found on your system.")
+
+    def _reset_yt_dlp_info(self) -> None:
+        if not hasattr(self, "download_btn") or self.download_btn.isEnabled():
+            self.yt_dlp_info.setText(YT_DLP_INFO_NEUTRAL)
+
+    def _choose_yt_dlp(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Choose yt-dlp executable", self.yt_dlp_edit.text())
+        if path:
+            self.yt_dlp_edit.setText(path)
+
+    def _show_tool_info(self, text: str) -> None:
+        self.yt_dlp_info.setText(self._safe(text.replace("yt-dlp ", "yt-dlp: ", 1)))
 
     def _auth_values(self) -> dict:
         return dict(auth_mode=self.auth_combo.currentText(), browser=self.browser_combo.currentData(),
@@ -727,8 +833,11 @@ class DownloadVideoDialog(QDialog):
         url = self.url_edit.text().strip()
         output_folder = Path(self.folder_edit.text()).expanduser()
         auth = self._auth_values()
+        tool_settings = dict(yt_dlp_mode=self.yt_dlp_combo.currentText(), yt_dlp_path=self.yt_dlp_edit.text())
         self._redaction_literals = (auth["cookie_file"], auth["browser_profile"])
         try:
+            if tool_settings["yt_dlp_mode"] == "Custom executable":
+                custom_yt_dlp_tool(tool_settings["yt_dlp_path"])
             cmd = build_download_command(["yt-dlp"], url=url, quality=self.quality_combo.currentText(),
                                          output_folder=output_folder, **auth)
             if auth["auth_mode"] == "Browser cookies":
@@ -741,9 +850,10 @@ class DownloadVideoDialog(QDialog):
             QMessageBox.warning(self, "Download input", str(exc))
             return
         if self._settings is not None:
-            for key, value in auth.items():
+            for key, value in {**auth, **tool_settings}.items():
                 self._settings.setValue("downloader/" + key, value)
         self.details_edit.clear()  # The worker supplies the config note with its diagnostics.
+        self.yt_dlp_info.setText("yt-dlp: checking version...")
         self.progress_bar.setValue(0)
         self.status_label.setText("Starting download...")
         self.download_btn.setEnabled(False)
@@ -753,6 +863,8 @@ class DownloadVideoDialog(QDialog):
         self.folder_btn.setEnabled(False)
         self.auth_combo.setEnabled(False)
         self._auth_changed()
+        self.yt_dlp_combo.setEnabled(False)
+        self._yt_dlp_changed()
 
         thread = QThread(self)
         worker = DownloadWorker(
@@ -760,13 +872,14 @@ class DownloadVideoDialog(QDialog):
             self.quality_combo.currentText(),
             output_folder,
             self._ffmpeg_path,
-            **auth, extra_literals=self._redaction_literals,
+            **auth, **tool_settings, extra_literals=self._redaction_literals,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.progress.connect(self.progress_bar.setValue, Qt.QueuedConnection)
         worker.status.connect(self.status_label.setText, Qt.QueuedConnection)
         worker.details.connect(self._append_details, Qt.QueuedConnection)
+        worker.tool_info.connect(self._show_tool_info, Qt.QueuedConnection)
         worker.finished.connect(self._download_finished, Qt.QueuedConnection)
         worker.failed.connect(self._download_failed, Qt.QueuedConnection)
         worker.cancelled.connect(self._download_cancelled, Qt.QueuedConnection)
@@ -807,6 +920,7 @@ class DownloadVideoDialog(QDialog):
         self._reset_controls()
 
     def _reset_controls(self) -> None:
+        self.yt_dlp_info.setText(YT_DLP_INFO_NEUTRAL)
         self.download_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         self.url_edit.setEnabled(True)
@@ -814,3 +928,5 @@ class DownloadVideoDialog(QDialog):
         self.folder_btn.setEnabled(True)
         self.auth_combo.setEnabled(True)
         self._auth_changed()
+        self.yt_dlp_combo.setEnabled(True)
+        self._yt_dlp_changed()

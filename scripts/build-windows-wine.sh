@@ -53,13 +53,73 @@ FFMPEG_LICENSE="$FF_DIR/LICENSE"
 [ -f "$FFMPEG_EXE" ] || { echo "ffmpeg.exe missing after extract"; exit 1; }
 
 YTDLP_EXE="$ROOT/build/yt-dlp.exe"
-if [ ! -f "$YTDLP_EXE" ]; then
-  echo "==> Downloading standalone Windows yt-dlp"
-  curl -fL --retry 3 --silent --show-error \
-    -o "$YTDLP_EXE" \
-    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
-fi
-[ -f "$YTDLP_EXE" ] || { echo "yt-dlp.exe missing after download"; exit 1; }
+YTDLP_PINS="$ROOT/packaging/yt-dlp-pins.json"
+# BEGIN yt-dlp pin
+fetch_yt_dlp() {
+    local platform="$1" dest="$2" fields tag asset expected actual tmp
+    fields=$(python3 -I -c '
+import json, re, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as stream:
+        pin = json.load(stream)
+    assert type(pin["schema"]) is int and pin["schema"] == 1, "schema must be 1"
+    tag = pin["tag"]
+    asset = pin["assets"][sys.argv[2]]
+    name, digest = asset["name"], asset["sha256"]
+    assert isinstance(tag, str) and re.fullmatch(r"[0-9]{4}\.[0-9]{2}\.[0-9]{2}", tag), "invalid tag"
+    assert isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9._-]+", name), "invalid asset name"
+    assert isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest), "invalid sha256"
+    print(tag, name, digest, sep="\t")
+except Exception as exc:
+    print("yt-dlp pin manifest invalid or unavailable: " + str(exc), file=sys.stderr)
+    sys.exit(1)
+' "$YTDLP_PINS" "$platform") || { rm -f -- "$dest" || return 1; return 1; }
+    IFS=$'\t' read -r tag asset expected <<< "$fields" || return 1
+    if [ -f "$dest" ]; then
+        actual=$(sha256sum < "$dest") || { rm -f -- "$dest" || return 1; return 1; }
+        actual=${actual%% *}
+        if [ "$actual" = "$expected" ]; then
+            if [ "$platform" = "linux-x86_64" ]; then
+                chmod 0755 -- "$dest" || return 1
+            else
+                chmod 0644 -- "$dest" || return 1
+            fi
+            echo "cached yt-dlp verified" || return 1
+            echo "yt-dlp $tag $asset sha256 $actual verified" || return 1
+            return 0
+        fi
+        echo "yt-dlp cache mismatch: expected $expected actual $actual; replacing" >&2 || return 1
+    fi
+    rm -f -- "$dest" || return 1
+    tmp=$(mktemp "${dest}.tmp.XXXXXX") || { echo "yt-dlp temporary file could not be created" >&2 || return 1; return 1; }
+    if ! curl --fail --location --retry 3 --max-time 300 --silent --show-error \
+        -o "$tmp" "https://github.com/yt-dlp/yt-dlp/releases/download/$tag/$asset"; then
+        actual=$(sha256sum < "$tmp") || actual="unavailable"
+        rm -f -- "$tmp" || return 1
+        echo "yt-dlp download failed: expected $expected actual ${actual%% *}" >&2 || return 1
+        return 1
+    fi
+    actual=$(sha256sum < "$tmp") || {
+        rm -f -- "$tmp" || return 1
+        echo "yt-dlp checksum failed: expected $expected actual unavailable" >&2 || return 1
+        return 1
+    }
+    actual=${actual%% *}
+    if [ "$actual" != "$expected" ]; then
+        rm -f -- "$tmp" || return 1
+        echo "yt-dlp checksum mismatch: expected $expected actual $actual" >&2 || return 1
+        return 1
+    fi
+    if [ "$platform" = "linux-x86_64" ]; then
+        chmod 0755 -- "$tmp" || { rm -f -- "$tmp" || return 1; return 1; }
+    else
+        chmod 0644 -- "$tmp" || { rm -f -- "$tmp" || return 1; return 1; }
+    fi
+    mv -f -- "$tmp" "$dest" || { rm -f -- "$tmp" || return 1; return 1; }
+    echo "yt-dlp $tag $asset sha256 $actual verified" || return 1
+}
+# END yt-dlp pin
+fetch_yt_dlp "windows-x86_64" "$YTDLP_EXE" || exit 1
 
 # Wine-side paths (win-style with drive letter)
 FFMPEG_WIN=$(winepath -w "$FFMPEG_EXE")

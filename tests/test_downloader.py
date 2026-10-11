@@ -474,6 +474,91 @@ def test_dialog_settings_controls_no_cookie_read(monkeypatch, tmp_path, mode):
     restored.close()
 
 
+def test_y2_info_initial_neutral():
+    dialog = d.DownloadVideoDialog()
+    assert dialog.yt_dlp_info.text() == "yt-dlp: version shown when a download starts"
+    dialog.close()
+
+
+@pytest.mark.parametrize("change", ["mode", "path"])
+def test_y2_info_selection_change_resets(change):
+    dialog = d.DownloadVideoDialog()
+    try:
+        dialog.yt_dlp_combo.setCurrentText("Custom executable")
+        dialog._show_tool_info("yt-dlp 2026.08.19 (custom)")
+        assert dialog.yt_dlp_info.text() == "yt-dlp: 2026.08.19 (custom)"
+        if change == "mode":
+            dialog.yt_dlp_combo.setCurrentText("Automatic")
+        else:
+            dialog.yt_dlp_edit.setText("another executable")
+        assert dialog.yt_dlp_info.text() == "yt-dlp: version shown when a download starts"
+    finally:
+        dialog.close()
+
+
+@pytest.fixture
+def y2_running_dialog(monkeypatch, tmp_path):
+    class FakeThread:
+        def __init__(self, *a):
+            self.started = SimpleNamespace(connect=lambda *a: None)
+            self.finished = SimpleNamespace(connect=lambda *a: None)
+        def quit(self): pass
+        def start(self): pass
+        def deleteLater(self): pass
+        def isRunning(self): return False
+    monkeypatch.setattr(d, "QThread", FakeThread)
+    monkeypatch.setattr(d.DownloadWorker, "moveToThread", lambda *a: None)
+    monkeypatch.setattr(d.QMessageBox, "warning", lambda *a: None)
+    dialog = d.DownloadVideoDialog()
+    dialog.yt_dlp_combo.setCurrentText("Custom executable")
+    dialog.yt_dlp_edit.setText(str(custom_executable(tmp_path)))
+    dialog.url_edit.setText("https://example.invalid/video")
+    dialog._start_download()
+    try:
+        yield dialog
+    finally:
+        dialog._thread_finished()
+        dialog.close()
+
+
+@pytest.mark.parametrize("outcome", ["failed", "missing", "input-error", "unverified", "cancelled"])
+def test_y2_info_terminal_reset(y2_running_dialog, outcome):
+    dialog = y2_running_dialog
+    assert dialog.yt_dlp_info.text() == "yt-dlp: checking version..."
+    if outcome == "failed":
+        dialog._worker.tool_info.emit("yt-dlp 2026.08.19 (custom)")
+        QApplication.processEvents()
+        assert dialog.yt_dlp_info.text() == "yt-dlp: 2026.08.19 (custom)"
+    if outcome == "cancelled":
+        dialog._worker.cancelled.emit()
+    else:
+        message = {"failed": d.failure_summary("GENERIC_DOWNLOAD_ERROR"),
+                   "missing": d.failure_summary("YT_DLP_MISSING"),
+                   "input-error": "Choose a custom yt-dlp executable.",
+                   "unverified": d.failure_summary("YT_DLP_UNVERIFIED")}[outcome]
+        dialog._worker.failed.emit(message)
+    QApplication.processEvents()
+    # The real QThread emits finished after the worker's terminal signal.
+    dialog._thread_finished()
+    assert dialog.yt_dlp_info.text() == "yt-dlp: version shown when a download starts"
+    assert dialog.yt_dlp_info.text() != "yt-dlp: checking version..."
+
+
+@pytest.mark.parametrize("probed", [False, True])
+def test_y2_info_running_changes_preserve_live_label(y2_running_dialog, probed):
+    dialog = y2_running_dialog
+    assert dialog.yt_dlp_info.text() == "yt-dlp: checking version..."
+    if probed:
+        dialog._worker.tool_info.emit("yt-dlp 2026.08.19 (custom)")
+        QApplication.processEvents()
+    expected = "yt-dlp: 2026.08.19 (custom)" if probed else "yt-dlp: checking version..."
+    assert dialog.yt_dlp_info.text() == expected
+    dialog.yt_dlp_combo.setCurrentText("Automatic")
+    assert dialog.yt_dlp_info.text() == expected
+    dialog.yt_dlp_edit.setText("programmatic path change")
+    assert dialog.yt_dlp_info.text() == expected
+
+
 @pytest.mark.parametrize("key,value", [("browser", "unknown"), ("browser_profile", "x::y"),
                                      ("cookie_file", "x\x00y")])
 def test_other_garbage_settings(tmp_path, key, value):
@@ -917,3 +1002,301 @@ def test_seeded_union_and_linear_inputs():
     for text in ('--cookies "' + 'a'*200000, 'Cookie:' + ' '*200000, 'Basic ' + 'a'*200000, 'X-' + 'x-'*100000):
         d.sanitize(text)
     assert time.monotonic() - started < 3, "diagnostic scanning must stay linear on large malformed input"
+
+
+# Y2 tests written before production changes. All children are fakes.
+def custom_executable(tmp_path, name="chosen yt-dlp Ω.exe"):
+    path = tmp_path / name
+    path.write_bytes(b"synthetic executable")
+    path.chmod(0o755)
+    return path
+
+
+def test_y2_default_dialog_executable_selection():
+    dialog = d.DownloadVideoDialog()
+    try:
+        combos = [c for c in dialog.findChildren(d.QComboBox)
+                  if c.accessibleName() == "yt-dlp executable mode"]
+        assert len(combos) == 1, "Download dialog must expose executable selection"
+        assert [combos[0].itemText(i) for i in range(combos[0].count())] == ["Automatic", "Custom executable"]
+        assert combos[0].currentText() == "Automatic"
+    finally:
+        dialog.close()
+
+
+def test_y2_probe_returns_real_version(monkeypatch, tmp_path):
+    worker = d.DownloadWorker("url", "Best", tmp_path)
+    monkeypatch.setattr(d.subprocess, "Popen", lambda *a, **kw: FakeProbe())
+    assert worker._version_details(d.DownloadTool(["fake"], "system"), {}) == "2026.08.19"
+
+
+@pytest.mark.parametrize("name", ["yt-dlp.exe", "path with spaces.exe", "下载 Ω.exe"])
+def test_y2_custom_invokes_exact_tool(monkeypatch, tmp_path, name):
+    path = custom_executable(tmp_path, name)
+    monkeypatch.setattr(d, "_yt_dlp_command", lambda: pytest.fail("Custom must never discover Automatic"))
+    probe = FakeProbe()
+    mp4 = tmp_path / "result.mp4"
+    mp4.write_bytes(b"synthetic mp4")
+    result, calls, details, *_ = run_worker(monkeypatch, tmp_path, FakeProc([str(mp4)]), probe,
+        yt_dlp_mode="Custom executable", yt_dlp_path=str(path))
+    assert result == ("finished", mp4)
+    assert probe.command == [str(path), "--ignore-config", "--version"]
+    assert probe.timeout == 10
+    assert calls[0][0][0] == str(path) and "--ignore-config" in calls[0][0]
+    assert "--cookies" not in calls[0][0] and "--cookies-from-browser" not in calls[0][0]
+    assert not calls[0][1].get("shell", False)
+    assert "yt-dlp 2026.08.19 (custom)" in "\n".join(details)
+
+
+@pytest.mark.parametrize("kind", ["empty", "missing", "directory", "url", "nul", "control", "self", "no-exec"])
+def test_y2_custom_static_validation(monkeypatch, tmp_path, kind):
+    path = custom_executable(tmp_path)
+    value = {"empty": "", "missing": str(tmp_path / "SECRET_MISSING"), "directory": str(tmp_path),
+             "url": "https://example.invalid/SECRET", "nul": "SECRET\0", "control": "SECRET\n",
+             "self": sys.executable, "no-exec": str(path)}[kind]
+    if kind == "no-exec":
+        if os.name == "nt":
+            pytest.skip("POSIX executable permission check")
+        path.chmod(0o644)
+    with pytest.raises(d.DownloadInputError) as error:
+        d.custom_yt_dlp_tool(value)
+    assert "SECRET" not in str(error.value) and (not value or value not in str(error.value))
+    monkeypatch.setattr(d, "_yt_dlp_command", lambda: pytest.fail("invalid Custom silently fell back"))
+    monkeypatch.setattr(d.subprocess, "Popen", lambda *a, **kw: pytest.fail("invalid Custom launched a process"))
+    worker = d.DownloadWorker("url", "Best", tmp_path, yt_dlp_mode="Custom executable", yt_dlp_path=value)
+    failed, imported = [], []
+    worker.failed.connect(failed.append)
+    worker.finished.connect(imported.append)
+    worker.run()
+    assert len(failed) == 1 and not imported
+
+
+def test_y2_windows_extension_validation(monkeypatch, tmp_path):
+    # Exercise Windows policy on real POSIX files; not a native Windows filesystem test.
+    monkeypatch.setattr(d, "os", SimpleNamespace(name="nt", access=os.access, X_OK=os.X_OK))
+    exe = custom_executable(tmp_path, "tool.EXE")
+    assert d.custom_yt_dlp_tool(str(exe)) == d.DownloadTool([str(exe)], "custom")
+    other = custom_executable(tmp_path, "tool.cmd")
+    with pytest.raises(d.DownloadInputError):
+        d.custom_yt_dlp_tool(str(other))
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+def test_y2_custom_never_launches_self_alias(monkeypatch, tmp_path, frozen):
+    alias = tmp_path / "Cove.exe"
+    try:
+        alias.symlink_to(sys.executable)
+    except OSError:
+        pytest.skip("symlink privileges unavailable")
+    monkeypatch.setattr(sys, "frozen", frozen, raising=False)
+    with pytest.raises(d.DownloadInputError):
+        d.custom_yt_dlp_tool(str(alias))
+
+
+@pytest.mark.parametrize("relative", [False, True])
+def test_y2_custom_preserves_selected_symlink(monkeypatch, tmp_path, relative):
+    target = custom_executable(tmp_path, "target executable.exe")
+    selected = tmp_path / "selected launcher Ω.exe"
+    try:
+        selected.symlink_to(target)
+    except OSError:
+        pytest.skip("symlink privileges unavailable")
+    monkeypatch.chdir(tmp_path)
+    value = selected.name if relative else str(selected)
+    monkeypatch.setattr(d, "_yt_dlp_command", lambda: pytest.fail("Custom must never discover Automatic"))
+    probe = FakeProbe()
+    mp4 = tmp_path / "result.mp4"
+    mp4.write_bytes(b"synthetic mp4")
+    result, calls, details, *_ = run_worker(monkeypatch, tmp_path, FakeProc([str(mp4)]), probe,
+        yt_dlp_mode="Custom executable", yt_dlp_path=value)
+    assert result == ("finished", mp4)
+    assert probe.command == [str(selected), "--ignore-config", "--version"]
+    assert calls[0][0][0] == str(selected)
+    assert f"Executable: {selected}" in "\n".join(details)
+    assert str(target) not in "\n".join(details)
+
+
+@pytest.mark.parametrize("mode", ["Automatic", "Custom executable"])
+@pytest.mark.parametrize("token", ["2026.08.19", "2026.08.19.232802", "2026.08.19" + "x" * 54,
+                                  "2026.08.19" + "x" * 55], ids=["normal", "nightly", "64-chars", "65-chars"])
+def test_y2_version_token_length(monkeypatch, tmp_path, mode, token):
+    selected = custom_executable(tmp_path)
+    monkeypatch.setattr(d, "_yt_dlp_command", lambda: d.DownloadTool(["automatic-fake"], "system"))
+    worker = d.DownloadWorker("https://example.invalid/video", "Best", tmp_path,
+                              yt_dlp_mode=mode, yt_dlp_path=str(selected))
+    probe = FakeProbe()
+    def communicate(timeout=None):
+        probe.timeout, probe.done = timeout, True
+        return "  " + token + "\n", None
+    probe.communicate = communicate
+    mp4 = tmp_path / "result.mp4"
+    mp4.write_bytes(b"synthetic mp4")
+    download = FakeProc([str(mp4)])
+    calls, outcomes, info, details = [], [], [], []
+    def spawn(cmd, **options):
+        calls.append(cmd)
+        return probe if "--version" in cmd else download
+    monkeypatch.setattr(d.subprocess, "Popen", spawn)
+    worker.finished.connect(lambda path: outcomes.append(("finished", path)))
+    worker.failed.connect(lambda text: outcomes.append(("failed", text)))
+    worker.tool_info.connect(info.append)
+    worker.details.connect(details.append)
+    dialog = d.DownloadVideoDialog()
+    worker.tool_info.connect(dialog._show_tool_info)
+    try:
+        worker.run()
+        source = "custom" if mode == "Custom executable" else "system"
+        version = token if len(token) <= 64 else "unknown"
+        assert info == [f"yt-dlp {version} ({source})"]
+        assert dialog.yt_dlp_info.text() == f"yt-dlp: {version} ({source})"
+        assert probe.timeout == 10
+        if len(token) > 64:
+            assert token not in "\n".join(details)
+        if len(token) > 64 and mode == "Custom executable":
+            assert outcomes == [("failed", d.failure_summary("YT_DLP_UNVERIFIED"))]
+            assert len(calls) == 1, "unrecognized Custom version must gate downloads"
+        else:
+            assert outcomes == [("finished", mp4)] and len(calls) == 2
+    finally:
+        dialog.close()
+
+
+def test_y2_automatic_invalid_probe_is_non_gating(monkeypatch, tmp_path, offline):
+    probe = FakeProbe()
+    probe.communicate = lambda timeout=None: ("unrecognized version", None)
+    mp4 = tmp_path / "automatic.mp4"
+    mp4.write_bytes(b"synthetic")
+    result, calls, *_ = run_worker(monkeypatch, tmp_path, FakeProc([str(mp4)]), probe)
+    assert result == ("finished", mp4) and len(calls) == 1
+
+
+@pytest.mark.parametrize("kind", ["invalid", "empty", "multiline", "failure", "timeout"])
+def test_y2_custom_probe_failure_gates_download(monkeypatch, tmp_path, kind):
+    path = custom_executable(tmp_path)
+    probe = FakeProbe(kind)
+    if kind in ("invalid", "empty", "multiline"):
+        def communicate(timeout=None):
+            probe.timeout, probe.done = timeout, True
+            return {"invalid": "SECRET not yt-dlp", "empty": "", "multiline": "2026.08.19\nSECRET"}[kind], None
+        probe.communicate = communicate
+    monkeypatch.setattr(d, "_yt_dlp_command", lambda: pytest.fail("Custom probe failure fell back"))
+    result, calls, *_ = run_worker(monkeypatch, tmp_path, FakeProc(), probe,
+        yt_dlp_mode="Custom executable", yt_dlp_path=str(path))
+    assert result == ("failed", "The selected yt-dlp could not be verified. Choose another executable or switch to Automatic.")
+    assert calls == [] and probe.timeout == 10
+    if kind == "timeout":
+        assert probe.killed == 1 and probe.done
+
+
+def test_y2_custom_cancel_probe(monkeypatch, tmp_path):
+    path = custom_executable(tmp_path)
+    worker = d.DownloadWorker("url", "Best", tmp_path, yt_dlp_mode="Custom executable", yt_dlp_path=str(path))
+    probe = FakeProbe("timeout")
+    def communicate(timeout=None):
+        assert timeout == 10
+        worker.cancel()
+        raise subprocess.TimeoutExpired("version", timeout)
+    probe.communicate = communicate
+    calls, outcomes = [], []
+    def spawn(cmd, **kw):
+        calls.append(cmd)
+        assert "--version" in cmd, "cancelled probe started a download"
+        return probe
+    monkeypatch.setattr(d.subprocess, "Popen", spawn)
+    worker.cancelled.connect(lambda: outcomes.append("cancelled"))
+    worker.failed.connect(lambda _: outcomes.append("failed"))
+    worker.run()
+    assert outcomes == ["cancelled"] and len(calls) == 1
+    assert probe.killed == 1 and probe.done
+
+
+def test_y2_tool_info_and_redaction(monkeypatch, tmp_path):
+    path = custom_executable(tmp_path)
+    worker = d.DownloadWorker("url", "Best", tmp_path, yt_dlp_mode="Custom executable", yt_dlp_path=str(path),
+                              browser_profile="PRIVATE_PROFILE", cookie_file="PRIVATE_COOKIES")
+    info, details = [], []
+    worker.tool_info.connect(info.append)
+    worker.details.connect(details.append)
+    monkeypatch.setattr(d.subprocess, "Popen", lambda *a, **kw: FakeProbe())
+    worker._version_details(d.custom_yt_dlp_tool(str(path)), {})
+    assert info == ["yt-dlp 2026.08.19 (custom)"]
+    assert not any("PRIVATE" in text for text in info + details)
+    dialog = d.DownloadVideoDialog()
+    dialog._show_tool_info(info[0])
+    assert dialog.yt_dlp_info.text() == "yt-dlp: 2026.08.19 (custom)"
+    dialog.close()
+
+
+@pytest.mark.parametrize("key,value", [("yt_dlp_mode", "bad"), ("yt_dlp_mode", 2),
+    ("yt_dlp_path", ["bad"]), ("yt_dlp_path", "x\0"), ("yt_dlp_path", "x\x7f"), ("yt_dlp_path", "x" * 4097)])
+def test_y2_malformed_settings(tmp_path, key, value):
+    settings = QSettings(str(tmp_path / "prefs.ini"), QSettings.IniFormat)
+    settings.setValue("downloader/yt_dlp_mode", "Custom executable")
+    settings.setValue("downloader/" + key, value)
+    dialog = d.DownloadVideoDialog(settings=settings)
+    assert dialog.yt_dlp_combo.currentText() == "Automatic" and dialog.yt_dlp_edit.text() == ""
+    dialog.close()
+
+
+def test_y2_dialog_custom_validation_keeps_text(monkeypatch, tmp_path):
+    dialog = d.DownloadVideoDialog()
+    dialog.url_edit.setText("https://example.invalid/video")
+    dialog.yt_dlp_combo.setCurrentText("Custom executable")
+    dialog.yt_dlp_edit.setText("SECRET_MISSING")
+    warnings = []
+    monkeypatch.setattr(d.QMessageBox, "warning", lambda *a: warnings.append(a[-1]))
+    monkeypatch.setattr(d, "QThread", lambda *a: pytest.fail("bad path started thread"))
+    monkeypatch.setattr(d.subprocess, "Popen", lambda *a, **kw: pytest.fail("dialog ran a probe"))
+    dialog._start_download()
+    assert len(warnings) == 1 and "SECRET" not in warnings[0]
+    assert dialog.yt_dlp_edit.text() == "SECRET_MISSING" and dialog._thread is None
+    assert dialog.auth_combo.currentText() == "None"
+    dialog.close()
+
+
+def test_y2_dialog_settings_wiring_controls(monkeypatch, tmp_path):
+    class FakeThread:
+        def __init__(self, *a):
+            self.started = SimpleNamespace(connect=lambda *a: None)
+            self.finished = SimpleNamespace(connect=lambda *a: None)
+        def quit(self): pass
+        def start(self): pass
+        def deleteLater(self): pass
+        def isRunning(self): return False
+    monkeypatch.setattr(d, "QThread", FakeThread)
+    monkeypatch.setattr(d.DownloadWorker, "moveToThread", lambda *a: None)
+    settings = QSettings(str(tmp_path / "prefs.ini"), QSettings.IniFormat)
+    dialog = d.DownloadVideoDialog(settings=settings)
+    assert dialog.yt_dlp_edit.isHidden() and not dialog.yt_dlp_edit.isEnabled()
+    assert dialog.yt_dlp_edit.accessibleName() == "Custom yt-dlp executable path"
+    assert dialog.yt_dlp_btn.accessibleName() == "Choose yt-dlp executable"
+    path = custom_executable(tmp_path)
+    dialog.yt_dlp_combo.setCurrentText("Custom executable")
+    dialog.yt_dlp_edit.setText(str(path))
+    assert not settings.contains("downloader/yt_dlp_mode"), "persist only at start"
+    assert dialog.auth_combo.currentText() == "None" and not dialog.cookie_btn.isEnabled()
+    assert "permissions" in dialog.yt_dlp_hint.text()
+    monkeypatch.setattr(d.QFileDialog, "getOpenFileName", lambda *a: (str(path), ""))
+    dialog.yt_dlp_btn.click()
+    assert dialog.yt_dlp_edit.text() == str(path)
+    dialog.url_edit.setText("https://example.invalid/video")
+    dialog._start_download()
+    for widget in (dialog.yt_dlp_combo, dialog.yt_dlp_edit, dialog.yt_dlp_btn):
+        assert not widget.isEnabled()
+    assert dialog._worker._yt_dlp_mode == "Custom executable" and dialog._worker._yt_dlp_path == str(path)
+    dialog._worker.tool_info.emit("yt-dlp 2026.08.19 (custom)")
+    QApplication.processEvents()
+    assert dialog.yt_dlp_info.text() == "yt-dlp: 2026.08.19 (custom)"
+    imported = []
+    dialog.downloadFinished.connect(imported.append)
+    monkeypatch.setattr(d.QMessageBox, "warning", lambda *a: None)
+    dialog._download_failed("fixed failure")
+    assert imported == []
+    dialog._thread_finished()
+    assert all(w.isEnabled() for w in (dialog.yt_dlp_combo, dialog.yt_dlp_edit, dialog.yt_dlp_btn))
+    dialog.close()
+    restored = d.DownloadVideoDialog(settings=settings)
+    assert restored.yt_dlp_combo.currentText() == "Custom executable"
+    assert restored.yt_dlp_edit.text() == str(path)
+    assert restored.auth_combo.currentText() == "None"
+    restored.close()
