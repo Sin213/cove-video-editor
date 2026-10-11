@@ -16,6 +16,10 @@ dependencies = [
 
 [project.scripts]
 cove-video-editor = "cove_video_editor.__main__:main"
+cove-video-editor-mcp = "cove_video_editor.mcp_server:main"
+
+[project.optional-dependencies]
+mcp = ["mcp==2.3.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
