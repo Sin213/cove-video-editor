@@ -11,15 +11,29 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QObject, QThread, Signal
 
 from . import ffmpeg_utils as ff
-from .clip import Clip, SubtitleTrack, sequence_length, sort_clips
+from .clip import AddedAudio, Clip, SubtitleTrack, sequence_length, sort_clips
 # The encoder argument group lives next to the format table because the
 # capability probe builds its command from it too; re-exported here since
 # this is where export command construction lives.
 from .ffmpeg_utils import build_export_video_encoder_args  # noqa: F401
+
+if TYPE_CHECKING:
+    from .project_io import ProjectState
+
+
+RESOLUTION_PRESETS = (
+    ("Auto (First Clip)", None),
+    ("3840 × 2160", (3840, 2160)),
+    ("1920 × 1080", (1920, 1080)),
+    ("1280 × 720", (1280, 720)),
+    ("1080 × 1920", (1080, 1920)),
+    ("1080 × 1080", (1080, 1080)),
+)
 
 
 #: Resolved once, and named, so the places that need to branch on the
@@ -315,6 +329,60 @@ class ExportJob:
         if self.clips:
             return sequence_length(self.clips)
         return _audio_only_duration(self.audio_tracks) if self.audio_tracks else 0.0
+
+
+def added_audio_tracks(
+    audios: list[AddedAudio], *, replace: bool, added_gain: float,
+    original_gain: float,
+) -> list[AudioTrack]:
+    """Map added audio to export tracks without changing stored edits."""
+    return [
+        AudioTrack(
+            path=audio.path,
+            replace=replace,
+            volume=0.0 if audio.muted else audio.volume * added_gain,
+            original_volume=original_gain,
+            offset=audio.offset,
+            duration=audio.src_span,
+            src_start=audio.src_start,
+        )
+        for audio in audios
+    ]
+
+
+def build_export_job(
+    state: ProjectState, *, output: str | Path, fmt_key: str,
+    size: tuple[int, int] | None = None, encoder_pref: str = "auto",
+    crop: tuple[int, int, int, int] | None = None,
+    region: tuple[float, float] | None = None,
+) -> ExportJob:
+    """Assemble a job from project edits and explicit export choices.
+
+    Dialogs, crop editing, encoder preference normalization and worker
+    startup belong to the caller. Construction only reads the project.
+    """
+    width, height = (
+        size
+        if size and ff.EXPORT_FORMATS[fmt_key]["vcodec"] is not None
+        else (None, None)
+    )
+    region_start, region_end = region if region is not None else (None, None)
+    return ExportJob(
+        clips=[c.clone() for c in state.clips],
+        output=Path(output),
+        fmt_key=fmt_key,
+        crop=crop,
+        width=width,
+        height=height,
+        audio_tracks=added_audio_tracks(
+            state.added_audios, replace=state.replace_added_audio,
+            added_gain=state.added_gain, original_gain=state.original_gain,
+        ),
+        region_start=region_start,
+        region_end=region_end,
+        subtitles=next((s.clone() for s in state.subtitles if s.active), None),
+        encoder_pref=encoder_pref,
+    )
 
 
 class ExportWorker(QObject):

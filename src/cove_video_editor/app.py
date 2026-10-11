@@ -113,7 +113,10 @@ from .crop_overlay import (
     CROP_ASPECT_PRESETS, FREE_PRESET, CropOverlay, compact_preset_label,
 )
 from .downloader import DownloadVideoDialog
-from .exporter import AudioTrack, ExportJob, start_export
+from .exporter import (
+    AudioTrack, RESOLUTION_PRESETS, added_audio_tracks, build_export_job,
+    start_export,
+)
 from .thumbnails import start_thumbnails, start_waveform
 from .timeline_widget import TimelineWidget
 
@@ -2185,14 +2188,7 @@ class MainWindow(QMainWindow):
         # back out of the label); "Auto" carries None so the exporter keeps
         # its first-real-clip behavior.
         self.resolution_combo = QComboBox()
-        self.resolution_combo.addItem("Auto (First Clip)", None)
-        for _label, _size in (
-            ("3840 × 2160", (3840, 2160)),
-            ("1920 × 1080", (1920, 1080)),
-            ("1280 × 720", (1280, 720)),
-            ("1080 × 1920", (1080, 1920)),
-            ("1080 × 1080", (1080, 1080)),
-        ):
+        for _label, _size in RESOLUTION_PRESETS:
             self.resolution_combo.addItem(_label, _size)
         self.resolution_combo.setCurrentIndex(0)
 
@@ -4645,27 +4641,13 @@ class MainWindow(QMainWindow):
             )
 
     def _build_added_audio_tracks(self) -> list[AudioTrack]:
-        """One `AudioTrack` per added-audio item, at its effective gain.
-
-        A muted item contributes zero regardless of its stored volume or the
-        master added-audio gain; everything else (replacement, placement,
-        trim) is unaffected. Read-only: the model is never written here, so
-        an item is still muted at its stored volume after an export."""
-        replace = self.audio_replace_cb.isChecked()
-        vol = self.audio_gain.value()
-        orig_vol = self.orig_gain.value()
-        return [
-            AudioTrack(
-                path=audio.path,
-                replace=replace,
-                volume=0.0 if audio.muted else audio.volume * vol,
-                original_volume=orig_vol,
-                offset=audio.offset,
-                duration=audio.src_span,
-                src_start=audio.src_start,
-            )
-            for audio in self._added_audios
-        ]
+        """One export track per added-audio item, at its effective gain."""
+        return added_audio_tracks(
+            self._added_audios,
+            replace=self.audio_replace_cb.isChecked(),
+            added_gain=self.audio_gain.value(),
+            original_gain=self.orig_gain.value(),
+        )
 
     def _on_export_clicked(self) -> None:
         # Export what the user can see. An open crop draft is committed
@@ -4689,30 +4671,13 @@ class MainWindow(QMainWindow):
         if not out_path:
             return
 
-        audio_tracks = self._build_added_audio_tracks()
-
-        region_start = region_end = None
-        if self._region_export_range is not None:
-            region_start, region_end = self._region_export_range
-
-        active_sub = next((s.clone() for s in self._subs if s.active), None)
-
-        # Resolution is a visual-only setting; audio-only jobs always leave
-        # width/height unset.
-        size = None if is_audio_only else self.resolution_combo.currentData()
-        out_w, out_h = size if size else (None, None)
-
-        job = ExportJob(
-            clips=[c.clone() for c in self._clips],
-            output=Path(out_path),
+        job = build_export_job(
+            self._project_state(),
+            output=out_path,
             fmt_key=fmt_key,
+            size=self.resolution_combo.currentData(),
             crop=self._crop_pixels(),
-            width=out_w,
-            height=out_h,
-            audio_tracks=audio_tracks,
-            region_start=region_start,
-            region_end=region_end,
-            subtitles=active_sub,
+            region=self._region_export_range,
             encoder_pref=self._selected_encoder_pref(),
         )
 

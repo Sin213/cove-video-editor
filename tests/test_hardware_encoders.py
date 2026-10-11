@@ -983,9 +983,28 @@ class GroupHEncoderUiAndSettings(unittest.TestCase):
         import inspect
         src = inspect.getsource(app_mod.MainWindow._build_ui)
         self.assertIn("self.resolution_combo", src)
-        self.assertIn("Auto (First Clip)", src)
-        self.assertIn("1280 × 720", src)
+        self.assertIn("RESOLUTION_PRESETS", src)
         self.assertIn("self.encoder_combo", src)
+        with _settings(), patch.object(
+            app_mod.MainWindow, "_start_encoder_probe", return_value=None,
+        ):
+            window = app_mod.MainWindow()
+            try:
+                combo = window.resolution_combo
+                self.assertEqual(
+                    [(combo.itemText(i), combo.itemData(i)) for i in range(combo.count())],
+                    [
+                        ("Auto (First Clip)", None),
+                        ("3840 × 2160", (3840, 2160)),
+                        ("1920 × 1080", (1920, 1080)),
+                        ("1280 × 720", (1280, 720)),
+                        ("1080 × 1920", (1080, 1920)),
+                        ("1080 × 1080", (1080, 1080)),
+                    ],
+                )
+                self.assertEqual(combo.currentIndex(), 0)
+            finally:
+                window.close()
 
     def test_h3_the_default_preference_is_automatic(self) -> None:
         with _settings():
