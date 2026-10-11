@@ -81,6 +81,9 @@ class ExportManager:
             p = self.session._project(project_id)
             if not p.saved or p.saved["revision"] != p.revision:
                 raise ap.AgentError("PROJECT_NOT_SAVED", "Save the current edit with cove_save_project before exporting.")
+            for sub in p.state.subtitles:
+                if sub.active and (not sub.cues or len(sub.cues) != p.subtitle_snapshots.get(sub.id, {}).get("cue_count")):
+                    raise ap.AgentError("INVALID_SUBTITLE", "Active subtitle snapshot is missing cues; call cove_set_subtitles again, then save.")
             try:
                 self.session._verify_project(p)
             except ap.AgentError as exc:

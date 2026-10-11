@@ -11,6 +11,8 @@ MAX_ASSETS, MAX_CLIPS, MAX_TIMELINE, MAX_WARNINGS = 200, 200, 86400, 50
 PROBE_TIMEOUT, PROBE_BUDGET, PROBE_OUTPUT_CAP = 10, 60, 65536
 EXTENSIONS = frozenset({".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"})
 AUDIO_EXTENSIONS = frozenset({".mp3", ".m4a", ".aac", ".wav", ".ogg", ".opus", ".flac"})
+SUBTITLE_EXTENSIONS = frozenset({".srt", ".vtt"})
+MAX_SUBTITLE_TRACKS, MAX_SUBTITLE_BYTES, MAX_SUBTITLE_CUES, MAX_SUBTITLE_CUE_CHARS = 8, 1048576, 5000, 1000
 MAX_AUDIO_ITEMS, MAX_AUDIO_LANE = 50, 63
 INPUT_OPTIONS = ("-protocol_whitelist", "file", "-format_whitelist",
                  "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi")
@@ -21,12 +23,13 @@ ERROR_CODES = frozenset("INVALID_ARGUMENT NOT_CONFIGURED PATH_NOT_AUTHORIZED FIL
     "ASSET_NOT_VIDEO INVALID_TIMELINE EMPTY_TIMELINE ASSET_CHANGED DESTINATION_EXISTS "
     "OUTPUT_FILESYSTEM_UNSUPPORTED OUTPUT_UNSAFE PROJECT_CHANGED_ON_DISK INTERNAL_ERROR "
     "EXPORT_BUSY PROJECT_NOT_SAVED UNKNOWN_EXPORT EXPORT_FAILED EXPORT_TIMEOUT "
-    "EXPORT_OUTPUT_INVALID SHUTTING_DOWN".split())
+    "EXPORT_OUTPUT_INVALID SHUTTING_DOWN INVALID_SUBTITLE UNKNOWN_CLIP REVISION_MISMATCH INVALID_CROP".split())
 LIMITS = dict(paths=MAX_PATHS, path_chars=MAX_PATH_CHARS, name_chars=MAX_NAME,
     projects=MAX_PROJECTS, assets=MAX_ASSETS, clips=MAX_CLIPS, timeline_s=MAX_TIMELINE,
     probe_timeout_s=PROBE_TIMEOUT, probe_budget_s=PROBE_BUDGET,
     probe_output_bytes=PROBE_OUTPUT_CAP, warnings=MAX_WARNINGS,
-    audio_items=MAX_AUDIO_ITEMS, audio_lane_max=MAX_AUDIO_LANE)
+    audio_items=MAX_AUDIO_ITEMS, audio_lane_max=MAX_AUDIO_LANE, subtitle_tracks=MAX_SUBTITLE_TRACKS,
+    subtitle_bytes=MAX_SUBTITLE_BYTES, subtitle_cues=MAX_SUBTITLE_CUES, subtitle_cue_chars=MAX_SUBTITLE_CUE_CHARS)
 class AgentError(Exception):
     def __init__(self, code: str, message: str):
         if code == "PATH_NOT_AUTHORIZED" and "See cove_get_capabilities media_roots." not in message:
@@ -75,8 +78,8 @@ def _media_hook(stage: str) -> None:
     """Deterministic race seam; production has no hook behavior."""
 @contextmanager
 def open_authorized_media(policy: PathPolicy, path: str, *, kind: str = "video"):
-    if kind not in {"video", "audio"}:
-        raise AgentError("INVALID_ARGUMENT", "Use video or audio media.")
+    if kind not in {"video", "audio", "subtitle"}:
+        raise AgentError("INVALID_ARGUMENT", "Use video, audio or subtitle media.")
     reject_unsafe_path_text(path)
     if not policy.media_roots:
         raise AgentError("NOT_CONFIGURED", "Configure a media root at startup.")
@@ -85,8 +88,15 @@ def open_authorized_media(policy: PathPolicy, path: str, *, kind: str = "video")
     canonical = os.path.realpath(path)
     if not _contained(canonical, policy.media_roots):
         raise AgentError("PATH_NOT_AUTHORIZED", "Path is outside authorized media roots. See cove_get_capabilities media_roots.")
-    if Path(canonical).suffix.lower() not in (AUDIO_EXTENSIONS if kind == "audio" else EXTENSIONS):
-        raise AgentError("UNSUPPORTED_EXTENSION", f"Only supported {kind} extensions are accepted.")
+    extensions = {"video": EXTENSIONS, "audio": AUDIO_EXTENSIONS, "subtitle": SUBTITLE_EXTENSIONS}[kind]
+    suffix = Path(canonical).suffix.lower()
+    if suffix not in extensions:
+        message = f"Only supported {kind} extensions are accepted."
+        if kind == "subtitle":
+            message = "Use a .srt or .vtt file."
+            if suffix in {".ass", ".ssa"}:
+                message += " Cove renders only parsed SRT/VTT cues; .ass/.ssa are unsupported."
+        raise AgentError("UNSUPPORTED_EXTENSION", message)
     _media_hook("before_open")
     try:
         # Open once; O_NOFOLLOW refuses a symlink swapped in after authorization.
@@ -107,6 +117,47 @@ def open_authorized_media(policy: PathPolicy, path: str, *, kind: str = "video")
         yield fd, canonical, file_identity(st)
     finally:
         os.close(fd)
+def read_subtitle_snapshot(fd: int, identity: tuple) -> tuple[str, str, int]:
+    """Read bounded bytes from the authorized held fd, never reopen its path."""
+    if file_identity(os.fstat(fd)) != identity:
+        raise AgentError("ASSET_CHANGED", "Subtitle changed before reading.")
+    chunks, size = [], 0
+    while size <= MAX_SUBTITLE_BYTES:
+        chunk = os.read(fd, min(65536, MAX_SUBTITLE_BYTES + 1 - size))
+        if not chunk:
+            break
+        chunks.append(chunk); size += len(chunk)
+    if file_identity(os.fstat(fd)) != identity:
+        raise AgentError("ASSET_CHANGED", "Subtitle changed while reading.")
+    if size > MAX_SUBTITLE_BYTES:
+        raise AgentError("LIMIT_EXCEEDED", "Subtitle exceeds 1 MiB.")
+    data = b"".join(chunks)
+    try:
+        text = data.decode("utf-8-sig", errors="strict")
+    except UnicodeDecodeError:
+        raise AgentError("INVALID_SUBTITLE", "Subtitle must be strict UTF-8 (BOM allowed).") from None
+    if any((ord(c) < 32 and c not in "\t\n\r") or ord(c) == 127 for c in text):
+        raise AgentError("INVALID_SUBTITLE", "Subtitle contains forbidden control characters.")
+    validate_subtitle_parse_cost(text)
+    return text, hashlib.sha256(data).hexdigest(), size
+def validate_subtitle_parse_cost(text: str) -> None:
+    """Linear scan bounds the shared parser's potentially quadratic regex work.
+
+    Timing searches see <=256 chars; blocks see <=8192 chars and <=16
+    unmatched openers after their last closer. With the 1 MiB byte bound,
+    both failed regex searches have a small fixed work factor per byte.
+    No content is altered; normalization mirrors parse_sub_cues exactly.
+    """
+    if text.count("-->") > MAX_SUBTITLE_CUES:
+        raise AgentError("LIMIT_EXCEEDED", "Too many timing markers; use at most 5000 cues.")
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    if any("-->" in line and len(line) > 256 for line in normalized.split("\n")):
+        raise AgentError("INVALID_SUBTITLE", "Timing line exceeds 256 characters; shorten it.")
+    for block in re.split(r"\n\n+", normalized.strip()):
+        if len(block) > 8192:
+            raise AgentError("INVALID_SUBTITLE", "Subtitle block exceeds 8192 characters; split or shorten it.")
+        if block.count("<", block.rfind(">") + 1) + block.count("{", block.rfind("}") + 1) > 16:
+            raise AgentError("INVALID_SUBTITLE", "Too many unterminated markup characters; balance markup or use at most 16.")
 def probe_fd(fd: int, *, timeout: float = PROBE_TIMEOUT, kind: str = "video") -> dict:
     if kind not in {"video", "audio"}:
         raise AgentError("INVALID_ARGUMENT", "Use video or audio media.")

@@ -1,4 +1,4 @@
-# Local MCP editing and export (M3a)
+# Local MCP editing and export (M3b)
 
 Install the optional source extra with `pip install '.[mcp]'` in your chosen
 environment. It pins `mcp==2.3.0`; the normal GUI neither needs nor imports MCP.
@@ -21,15 +21,14 @@ exit 2; missing optional SDK exits 1. The output root must support hard links.
 
 | Flag | File operations enabled |
 |---|---|
-| `--media-root DIR` (repeatable) | Inspect/import videos and add audio in DIR and its subfolders |
+| `--media-root DIR` (repeatable) | Inspect/import videos, add audio and read subtitles in DIR and its subfolders |
 | `--output-root DIR` | Create project folders, save revisions and publish exports in DIR |
 
 No flags means no file access. The agent cannot change these permissions.
 
 Agent edits live in memory until saved. Existing `.coveproj` editing, scene
-understanding and live GUI control remain unavailable. Subtitles, crop and
-existing-project import (`open_project`) are deliberately deferred and NOT
-available as MCP tools. Background audio and mix controls are supported now.
+understanding and live GUI control remain unavailable. Existing-project import
+(`open_project`) is deferred and NOT available as an MCP tool.
 
 | Tool | Behavior |
 |---|---|
@@ -40,6 +39,8 @@ available as MCP tools. Background audio and mix controls are supported now.
 | `cove_set_timeline` | Atomic replacement; sequential or explicit placement |
 | `cove_set_audio` | Atomic replacement of ALL added audio; `[]` clears it |
 | `cove_set_audio_mix` | Partial mix update; omitted fields retain their values |
+| `cove_set_subtitles` | Atomic replacement of ALL subtitle tracks; `[]` clears burn-in |
+| `cove_set_crop` | Update one clip's crop with clip_id and expected_revision; null clears |
 | `cove_get_project` | Assets, clips, audio, mix, revision, saved status and warnings |
 | `cove_save_project` | Immutable `.coveproj` revision and SHA-256 |
 | `cove_start_export` | Start rendering the current saved revision; return job_id |
@@ -96,12 +97,78 @@ state, and each successful call increments revision once. Importing videos and
 replacing the timeline preserve audio and mix. Saves include all audio/mix fields;
 exports retain their admission snapshot even if later edits change audio or mix.
 
+The editing workflow can add `cove_set_subtitles` and `cove_set_crop`
+after setting the timeline, then read the project, save and export as usual.
+Subtitles are burn-in only: no soft subtitles or sidecar output. Send a complete
+`tracks` list to replace, restyle or disable subtitles; `[]` clears them. Each
+track requires an absolute authorized `.srt` or `.vtt` path. ASS/SSA are refused
+because Cove renders only cues parsed by its existing SRT/VTT parser.
+Files must be strict UTF-8 (BOM accepted), at most 1 MiB, with 1–5000 valid cues,
+at most 1000 characters per cue and cue end at most 86400 seconds. NUL and
+control characters except tab/newline/carriage return are refused. Valid partial
+files are accepted; `skipped_cue_blocks` reports malformed timing blocks. Summary
+also includes cue_count, first_cue_s, last_cue_s and server-generated subtitle_id.
+Cue timestamps must include hours: `hh:mm:ss,mmm` (SRT) or `hh:mm:ss.mmm`
+(VTT). Short-form VTT `mm:ss.mmm` cues are not recognised by Cove's shared
+parser; mixed files report them in skipped_cue_blocks and a warning. A file
+with no recognised cues is rejected. Check skipped_cue_blocks after import.
+Parser safety caps also reject more than 5000 `-->` markers, timing lines
+over 256 characters, blocks over 8192 characters, and more than 16 combined
+unterminated `<`/`{` markers after each block's last corresponding closer.
+Ordinary literal text such as `I <3 you` is accepted without modification.
+
+There are at most 8 tracks and at most one active. **active defaults to true**;
+explicit false disables burn-in. Defaults: font_family Arial, font_size 36,
+primary_color #FFFFFF, outline_color #000000, outline 2, position bottom,
+offset_ms 0. Font size is integer 10–120; outline integer 0–8; colours #RRGGBB;
+position bottom or top; offset integer -30000–30000 milliseconds. Positive offset
+delays cues. Font names are 1–64 letters/digits/spaces/period/underscore/hyphen,
+starting with a letter/digit. The named font must be installed; Linux libass
+falls back if unavailable, so Unicode glyph appearance depends on installed fonts.
+No-active and active-outside-timeline warnings explain exports without text.
+
+`cove_get_project` and `cove_set_timeline` expose `clips[].clip_id`, `crop` and
+`crop_pixels`. Read the current `revision`, then call
+`cove_set_crop(project_id, clip_id, expected_revision, crop)`. The crop object
+requires x, y, width, height normalized to the **source** frame, independent of
+trim, playback speed or output size. The origin is the source's TOP-LEFT corner;
+x increases rightward and y downward. For a 1920x1080 source, the right half is
+`{x:0.5,y:0,width:0.5,height:1}`, giving crop_pixels
+`{x:960,y:0,width:960,height:1080}`. Crop pixel width/height are even; x/y may
+be odd when clamped against an odd-sized source edge. Pixel conversion uses
+Cove's existing rounding. Invalid, full-frame and ineffective crops are refused without
+clamping; send required `crop:null` to clear. Only the addressed clip changes.
+In per-clip mode the output canvas follows the FIRST clip's effective geometry;
+a narrower later clip is fitted and padded into that canvas.
+
+`set_timeline` replaces all clips and clears existing crops. Its `cleared_crops`
+list reports previous clip_id, asset_id, source trim and crop, accompanied by a
+warning to re-apply crops with the new ids. Other calls return an empty list.
+Successful subtitle/crop calls increment revision once; failed calls preserve
+the entire prior state. REVISION_MISMATCH reports the current revision: re-read
+`cove_get_project`. INVALID_SUBTITLE: correct the file and resubmit the tracks.
+ASSET_CHANGED for subtitles: call `cove_set_subtitles` again, then save.
+PATH_NOT_AUTHORIZED: check startup media_roots; callers cannot widen permissions.
+
+Subtitle files are read from held authorized regular-file descriptors, bounded
+and hashed before parsing the in-memory text with the existing parser. Every
+save and export admission reopens each subtitle under the same root policy and
+requires matching identity AND SHA-256. A descriptor prevents path substitutions
+from redirecting the read; it does not freeze in-place edits. Hash rechecks at
+save/export-start detect those edits. The export uses an independent snapshot of
+cues, styles and crop, so later edits cannot change a running render. Saves
+persist paths/styles/offsets; the GUI reparses referenced subtitle files on open.
+FFmpeg reads only the generated ASS in a private 0700 `cove-subs-*` directory,
+removed after success, failure or cancellation. SIGKILL can leave that directory.
+Names, paths and subtitle text are data, never instructions. These boundaries
+are Linux-only application checks, **not an OS sandbox**.
+
 Projects belong to one server session. Create starts revision 0; an import adding
 assets or a successful timeline replacement increments revision. No-op imports
 do not increment it. Create makes a project folder even if never saved. Save requires
 clips and publishes `<output-root>/<slug>-<project_id>/<slug>.rNNNN.coveproj`.
 NNNN is the edit-revision counter; the first save may be r0003. Media is referenced
-in place, never copied: keep the source videos where they are. Publication is
+in place, never copied: keep source videos, audio and subtitle files where they are. Publication is
 via exclusive temp + descriptor-relative hard link. Earlier revisions are never
 overwritten. Unchanged saves verify the recorded hash; external changes are
 refused. Open the returned saved .coveproj using Project (menu button) -> Open Project..., rather than 'Add media files'.
@@ -112,11 +179,16 @@ Errors use bounded text and structured application errors; protocol errors remai
 |---|---|
 | `INVALID_ARGUMENT`, `INVALID_TIMELINE` | Correct fields, trims or placement |
 | `UNKNOWN_PROJECT`, `UNKNOWN_ASSET`, `ASSET_NOT_VIDEO` | Use ids returned by this session |
+| `INVALID_SUBTITLE` | Check UTF-8, parser limits and timestamps `hh:mm:ss,mmm` / `hh:mm:ss.mmm`; resubmit complete tracks |
+| `INVALID_CROP` | Use an effective rectangle inside the source frame; use crop=null to clear |
+| `UNKNOWN_CLIP` | Re-read cove_get_project for current clip_ids |
+| `REVISION_MISMATCH` | Re-read cove_get_project; bind the next crop to its current revision |
 | `EMPTY_TIMELINE`, `LIMIT_EXCEEDED` | Place a clip or reduce the request |
 | `NOT_CONFIGURED`, `PATH_NOT_AUTHORIZED` | Configure appropriate startup roots |
 | `FILE_NOT_FOUND`, `NOT_A_REGULAR_FILE`, `UNSUPPORTED_EXTENSION`, `UNSUPPORTED_MEDIA` | Choose authorized supported media; added audio must decode and contain no real video |
 | `PROBE_TIMEOUT`, `PROBE_FAILED`, `PROBE_OUTPUT_TOO_LARGE`, `PROBE_BUDGET_EXCEEDED` | Inspect locally or reduce the batch |
 | `ASSET_CHANGED` | For audio, call cove_set_audio again with the complete replacement, then save; for video, create a fresh project and import again |
+| `ASSET_CHANGED` (subtitle) | Re-submit the COMPLETE track list with cove_set_subtitles even if the file looks unchanged, then save: identity AND SHA-256 are rechecked; a byte-identical replacement or touched file still counts as changed |
 | `PROJECT_CHANGED_ON_DISK` | For export, call cove_set_timeline again for a new revision (or create a fresh project), then save and export; preserve the externally changed file |
 | `DESTINATION_EXISTS` | Choose another output_name: export rejects an existing name at start, or at publication if it appears during rendering; for save, use a fresh project/revision |
 | `OUTPUT_FILESYSTEM_UNSUPPORTED`, `OUTPUT_UNSAFE` | Fix the output directory/filesystem |
@@ -127,7 +199,7 @@ Errors use bounded text and structured application errors; protocol errors remai
 | `EXPORT_TIMEOUT` | Shorten the edit, or if you used encoder=auto, retry with encoder=cpu. |
 | `SHUTTING_DOWN` | Ask the operator to restart the server. |
 
-For export, `ASSET_CHANGED` uses the audio/video recovery above; audio errors
+For export, `ASSET_CHANGED` uses the audio/video/subtitle recovery above; errors
 identify the affected item/id/path where available.
 `DESTINATION_EXISTS` means choose another output name; existing files, directories
 and symlinks (including dangling ones) are rejected before rendering. A name that
@@ -141,6 +213,9 @@ Verify: ask the agent to call `cove_get_capabilities`; check `media_roots`/`outp
 2. Agent sets sequential clips with source trims in SECONDS, then gets the project to check it.
    If requested, set the complete background audio list with `cove_set_audio`,
    then update selected mix fields with `cove_set_audio_mix` and check the summary.
+   If requested, replace subtitle tracks with `cove_set_subtitles` and set each
+   clip's crop with `cove_set_crop`, using clip_id and the latest revision.
+   Every successful edit returns the new revision; use it for the next set_crop.
 3. Agent saves the revision and returns its path for manual opening in Cove.
 4. Agent calls `cove_start_export` with project_id and a new output_name, then
    polls `cove_get_export_status` until SUCCEEDED, FAILED or CANCELLED. Return the
@@ -151,7 +226,7 @@ After export: open the saved .coveproj via Project (menu button) -> Open Project
 never 'Add media files'. Play the MP4 at output.path in any media player;
 'Add media files' may import that MP4 into Cove as a clip.
 
-Export options: format `mp4` (H.264 + AAC); resolution `source` (first clip's native size), `3840x2160`,
+Export options: format `mp4` (H.264 + AAC); resolution `source` (first clip's effective cropped size), `3840x2160`,
 `1920x1080`, `1280x720`, `1080x1920` or `1080x1080`; encoder `cpu` (default) or
 `auto` (bounded hardware probes with CPU fallback). output_name must match
 `^[A-Za-z0-9][A-Za-z0-9._-]{0,95}\.mp4$`. Output belongs to the server-created
@@ -213,5 +288,5 @@ Same-user compromised processes, hard-linked files inside roots and untested
 exotic demuxer behavior are out of scope. FFmpeg parses the media bytes.
 A calibrated local file-open observer checks disguised concat rendering, including
 an unrestricted positive control. It does not establish protection from every
-demuxer or a compromised same-user process. Subtitles, crop, existing-project
-import and packaged Windows execution remain future work.
+demuxer or a compromised same-user process. Existing-project import and
+packaged Windows execution remain future work.

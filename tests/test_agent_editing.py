@@ -387,10 +387,10 @@ def test_video_only_whitelist_stays_strict(audio_edit, monkeypatch):
 
 def test_audio_capabilities(audio_edit):
     s, _, _, _ = audio_edit; caps = s.capabilities()
-    assert len(caps['operations']) == 12
+    assert len(caps['operations']) == 14
     assert {'cove_set_audio', 'cove_set_audio_mix'} <= set(caps['operations'])
     assert caps['media_kinds'] == ['video', 'audio']
     assert caps['audio_extensions'] == ['.aac', '.flac', '.m4a', '.mp3', '.ogg', '.opus', '.wav']
     assert caps['limits']['audio_items'] == 50 and caps['limits']['audio_lane_max'] == 63
-    assert caps['deferred'] == ['subtitles', 'crop', 'open_project']
+    assert caps['deferred'] == ['open_project']
     assert 'background audio' in caps['supported']

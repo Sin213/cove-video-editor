@@ -152,7 +152,7 @@ def test_tools_and_workflow(tmp_path, transport):
                 tools = (await client.list_tools()).tools
                 names = {t.name for t in tools}
                 assert names == {"cove_" + n for n in ("get_capabilities", "inspect_media", "create_project",
-                    "import_media", "set_timeline", "get_project", "save_project", "start_export", "get_export_status", "cancel_export", "set_audio", "set_audio_mix")}
+                    "import_media", "set_timeline", "get_project", "save_project", "start_export", "get_export_status", "cancel_export", "set_audio", "set_audio_mix", "set_subtitles", "set_crop")}
                 assert all(t.input_schema.get("additionalProperties") is False and t.output_schema for t in tools)
                 assert all(len(t.description) >= 80 for t in tools)
                 schemas = {t.name: t.input_schema for t in tools}
@@ -324,7 +324,7 @@ def test_sdk_stdio_export_audio_oracle(tmp_path):
         with anyio.fail_after(25):
             async with stdio_client(params) as streams, ClientSession(*streams, read_timeout_seconds=10) as client:
                 await client.initialize()
-                assert len((await client.list_tools()).tools) == 12
+                assert len((await client.list_tools()).tools) == 14
                 async def call(name, /, **args):
                     result = await client.call_tool('cove_' + name, args)
                     assert not result.is_error, result
@@ -485,12 +485,14 @@ def test_raw_stdout_export_lifecycle(tmp_path):
         client.close()  # Validate every remaining stdout frame, including EOF cleanup.
 
 @pytest.mark.parametrize('mode', ['cancel', 'eof', 'sigterm', 'prepare_eof'])
-def test_real_export_active_cancel_and_disconnect(tmp_path, mode):
+def test_real_export_active_cancel_and_disconnect(tmp_path, monkeypatch, mode):
     pytest.importorskip('mcp')
     root, out = tmp_path/'media', tmp_path/'out'; out.mkdir()
     paths = export_media(root, duration=30)
     from test_agent_editing import tones
     music = tones(root/'background.wav')
+    owned=tmp_path/'ass-tmp'; owned.mkdir()
+    monkeypatch.setenv('TMPDIR',str(owned))
     client = ExportStdio(root, out, prepare=mode == 'prepare_eof')
     try:
         pid = client.call('create_project', name='Long render')['project_id']
@@ -501,6 +503,11 @@ def test_real_export_active_cancel_and_disconnect(tmp_path, mode):
             dict(asset_id=aid,src_start_s=0,src_end_s=30,speed=0.25)])
         client.call('set_audio', project_id=pid, items=[dict(path=str(music))])
         client.call('set_audio_mix', project_id=pid, added_gain=0.5)
+        from test_agent_subtitles import SRT, STYLE
+        sub=root/'captions.srt'; sub.write_text(SRT)
+        summary=client.call('set_subtitles',project_id=pid,tracks=[dict(path=str(sub),**STYLE)])
+        client.call('set_crop',project_id=pid,clip_id=summary['clips'][0]['clip_id'],expected_revision=summary['revision'],
+            crop=dict(x=0.5,y=0,width=0.5,height=1))
         client.call('save_project', project_id=pid)
         started = client.call('start_export', project_id=pid, output_name='long.mp4', resolution='1920x1080')
         child_pids = []
@@ -514,6 +521,7 @@ def test_real_export_active_cancel_and_disconnect(tmp_path, mode):
                     child_pids = client.children()
                     assert child_pids and all(Path(f'/proc/{p}').exists() for p in child_pids)
                     assert all(Path(f'/proc/{p}/comm').read_text().strip() == 'ffmpeg' for p in child_pids)
+                    assert len(list(owned.glob('cove-subs-*')))==1
                     break
                 assert time.monotonic() < deadline
                 time.sleep(0.02)
@@ -538,6 +546,7 @@ def test_real_export_active_cancel_and_disconnect(tmp_path, mode):
         assert time.monotonic()-began < 15
         assert all(not Path(f'/proc/{p}').exists() for p in child_pids), 'FFmpeg must be reaped'
         assert not list(out.rglob('long.mp4')) and not list(out.rglob('.export-*'))
+        assert not list(owned.glob('cove-subs-*'))
     finally:
         client.close()
 
@@ -598,7 +607,7 @@ def test_sdk_stdio_background_audio_snapshot(tmp_path):
             async with stdio_client(params) as streams, ClientSession(*streams, read_timeout_seconds=10) as client:
                 await client.initialize()
                 tools = (await client.list_tools()).tools
-                assert len(tools) == 12
+                assert len(tools) == 14
                 schemas = {t.name:t.input_schema for t in tools}
                 fields = schemas['cove_set_audio']['$defs']['AudioItem']['properties']
                 assert all(fields[n].get('description') for n in fields)
@@ -639,3 +648,112 @@ def test_sdk_stdio_background_audio_snapshot(tmp_path):
                 assert amplitude(samples,440) < 30 and amplitude(samples,660) < 30
                 assert amplitude(samples,880,0.1,0.3) < 20
     anyio.run(run)
+
+@pytest.mark.parametrize('transport',['memory','stdio'])
+def test_sdk_subtitle_crop_workflow(tmp_path,monkeypatch,transport):
+    pytest.importorskip('mcp')
+    import anyio
+    import mcp.client.stdio as stdio
+    from contextlib import asynccontextmanager
+    from mcp.client.session import ClientSession
+    from mcp.client import Client
+    from mcp.client._memory import InMemoryTransport
+    from cove_video_editor.agent_session import AgentSession
+    from cove_video_editor.agent_paths import validate_roots
+    from cove_video_editor.mcp_server import build_server
+    from cove_video_editor.project_io import load_project
+    from test_agent_crop import quadrants, RIGHT, assert_quadrants
+    from test_agent_subtitles import SRT, STYLE, frame, red_pixels
+    from test_agent_editing import tones, pcm, amplitude
+    root,out,owned=tmp_path/'media',tmp_path/'out',tmp_path/'ass-tmp'
+    root.mkdir(); out.mkdir(); owned.mkdir()
+    path=quadrants(root/'quad.mp4'); music=tones(root/'music.wav'); sub=root/'text.srt'; sub.write_text(SRT)
+    processes=[]; original=stdio._create_platform_compatible_process
+    async def capture(*args,**kwargs):
+        process=await original(*args,**kwargs); processes.append(process); return process
+    monkeypatch.setattr(stdio,'_create_platform_compatible_process',capture)
+    @asynccontextmanager
+    async def connect():
+        if transport=='memory':
+            session=AgentSession(validate_roots([str(root)],str(out)))
+            try:
+                async with Client(InMemoryTransport(build_server(session)),mode='legacy') as client: yield client.session
+            finally: session.close()
+        else:
+            params=stdio.StdioServerParameters(command=sys.executable,args=['-m','cove_video_editor.mcp_server',
+                '--media-root',str(root),'--output-root',str(out)],env=dict(os.environ,TMPDIR=str(owned)))
+            async with stdio.stdio_client(params) as streams, ClientSession(*streams,read_timeout_seconds=10) as client:
+                await client.initialize(); yield client
+    async def protocol():
+        with anyio.fail_after(45):
+            async with connect() as client:
+                tools=(await client.list_tools()).tools; assert len(tools)==14
+                schemas={t.name:t.input_schema for t in tools}
+                active=schemas['cove_set_subtitles']['$defs']['SubtitleTrackInput']['properties']['active']
+                assert active['default'] is True and 'defaults to true' in active['description']
+                fields=schemas['cove_set_subtitles']['$defs']['SubtitleTrackInput']['properties']
+                assert all(fields[k].get('description') for k in ('font_family','font_size','primary_color','outline_color','outline','position','offset_ms'))
+                assert 'effective (cropped)' in schemas['cove_start_export']['properties']['resolution']['description']
+                assert 'TOP-LEFT' in schemas['cove_set_crop']['properties']['crop']['description']
+                assert {'crop','expected_revision','clip_id'} <= set(schemas['cove_set_crop']['required'])
+                async def call(name,/,**args):
+                    reply=await client.call_tool('cove_'+name,args); assert not reply.is_error,reply
+                    return reply.structured_content
+                pid=(await call('create_project',name='Subtitles and crop'))['project_id']
+                aid=(await call('import_media',project_id=pid,paths=[str(path)]))['assets'][0]['asset_id']
+                await call('set_timeline',project_id=pid,placement='sequential',clips=[dict(asset_id=aid,src_start_s=0,src_end_s=3)])
+                await call('set_audio',project_id=pid,items=[dict(path=str(music))])
+                summary=await call('set_subtitles',project_id=pid,tracks=[dict(path=str(sub),**STYLE)])
+                cid=summary['clips'][0]['clip_id']
+                summary=await call('set_crop',project_id=pid,clip_id=cid,expected_revision=summary['revision'],crop=RIGHT)
+                assert summary['clips'][0]['crop_pixels']==dict(x=160,y=0,width=160,height=240)
+                assert summary['subtitles'][0]['primary_color']=='#FF0000' and summary['subtitles'][0]['cue_count']==1
+                assert await call('get_project',project_id=pid)==summary
+                bads=[('set_subtitles',dict(tracks=[dict(path=str(sub),font_family='Arial\n[Events]')])),
+                    ('set_subtitles',dict(tracks=[dict(path=str(sub),font_size=True)])),
+                    ('set_subtitles',dict(tracks=[dict(path=str(sub),active=1)])),
+                    ('set_subtitles',dict(tracks=[dict(path=str(sub),extra=1)])),
+                    ('set_crop',dict(clip_id=cid,expected_revision=summary['revision'],crop=dict(x=0,y=0,width=2,height=1))),
+                    ('set_crop',dict(clip_id=cid,expected_revision=0,crop=RIGHT)),
+                    ('set_crop',dict(clip_id=cid,expected_revision=summary['revision'])),
+                    ('set_crop',dict(clip_id=cid,expected_revision=True,crop=RIGHT))]
+                for name,args in bads:
+                    reply=await client.call_tool('cove_'+name,dict(project_id=pid)|args); assert reply.is_error
+                    assert await call('get_project',project_id=pid)==summary
+                saved=await call('save_project',project_id=pid); loaded=load_project(Path(saved['path']))
+                assert loaded.clips[0].crop_rect==(0.5,0,0.5,1) and loaded.subtitles[0].font_size==48 and loaded.added_audios
+                async def export(name):
+                    await call('save_project',project_id=pid)
+                    started=await call('start_export',project_id=pid,output_name=name)
+                    while True:
+                        status=await call('get_export_status',job_id=started['job_id'])
+                        if status['state'] in {'SUCCEEDED','FAILED','CANCELLED'}: break
+                        await anyio.sleep(0.01)
+                    assert status['state']=='SUCCEEDED',status
+                    return status['output']
+                burned=await export('burned.mp4'); assert (burned['width'],burned['height'])==(160,240)
+                assert_quadrants(burned,right=True); assert red_pixels(frame(burned['path'],1.1),160,240)>20
+                assert amplitude(pcm(burned['path']),660)>1000
+                summary=await call('set_crop',project_id=pid,clip_id=cid,expected_revision=summary['revision'],crop=None)
+                full=await export('full.mp4'); assert (full['width'],full['height'])==(320,240); assert_quadrants(full)
+                await call('set_subtitles',project_id=pid,tracks=[dict(path=str(sub),active=False,**STYLE)])
+                disabled=await export('disabled.mp4'); assert frame(disabled['path'],1.1)!=frame(full['path'],1.1)
+                await call('set_subtitles',project_id=pid,tracks=[dict(path=str(sub),**STYLE)])
+                await call('save_project',project_id=pid); sub.unlink(); sub.write_text(SRT.replace('RED','NEW'))
+                reply=await client.call_tool('cove_start_export',dict(project_id=pid,output_name='changed.mp4'))
+                assert reply.is_error and reply.structured_content['error']['code']=='ASSET_CHANGED'
+                await call('set_subtitles',project_id=pid,tracks=[dict(path=str(sub),**STYLE)])
+                await call('save_project',project_id=pid); path.unlink()
+                reply=await client.call_tool('cove_start_export',dict(project_id=pid,output_name='missing.mp4'))
+                assert reply.is_error and reply.structured_content['error']['code']=='ASSET_CHANGED'
+    async def run():
+        async def heartbeat():
+            while True: await anyio.sleep(0.01)
+        async with anyio.create_task_group() as group:
+            group.start_soon(heartbeat)
+            try: await protocol()
+            finally: group.cancel_scope.cancel()
+    anyio.run(run)
+    assert all(p.returncode==0 for p in processes)
+    if transport=='stdio': assert len(processes)==1
+    assert not list(owned.glob('cove-subs-*'))

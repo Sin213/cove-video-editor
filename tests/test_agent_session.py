@@ -142,7 +142,8 @@ def test_budget_warnings_and_asset_kind(editing, monkeypatch):
     assert len(s.get_project(pid)["warnings"]) == 50
     assert s.capabilities()["limits"] == dict(paths=50, path_chars=4096, name_chars=80, projects=20,
         assets=200, clips=200, timeline_s=86400, probe_timeout_s=10, probe_budget_s=60,
-        probe_output_bytes=65536, warnings=50, audio_items=50, audio_lane_max=63)
+        probe_output_bytes=65536, warnings=50, audio_items=50, audio_lane_max=63,
+        subtitle_tracks=8, subtitle_bytes=1048576, subtitle_cues=5000, subtitle_cue_chars=1000)
     asset = s.projects[pid].state.assets[0]
     asset.kind = "audio"
     with rejected("ASSET_NOT_VIDEO"):
