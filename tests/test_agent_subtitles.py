@@ -28,9 +28,9 @@ def test_cues_survive_validated_candidate(subtitled):
     assert candidate.subtitles[0].cues is not state.subtitles[0].cues
 def test_subtitle_capabilities(subtitled):
     caps = subtitled[0].capabilities()
-    assert 'cove_set_subtitles' in caps['operations'] and len(caps['operations']) == 14
+    assert 'cove_set_subtitles' in caps['operations'] and 'cove_open_project' in caps['operations'] and len(caps['operations']) == 15
     assert caps['subtitle_extensions'] == ['.srt', '.vtt']
-    assert caps['deferred'] == ['open_project']
+    assert caps['deferred'] == []
     assert {k: caps['limits'][k] for k in ('subtitle_tracks','subtitle_bytes','subtitle_cues','subtitle_cue_chars')} == dict(
         subtitle_tracks=8, subtitle_bytes=1048576, subtitle_cues=5000, subtitle_cue_chars=1000)
 @pytest.mark.parametrize('text,suffix', [(SRT,'.srt'), ('\ufeff'+SRT,'.srt'),

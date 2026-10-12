@@ -1,6 +1,7 @@
 """Server-owned edits; candidates validate before becoming visible."""
 from __future__ import annotations
 import hashlib, math, os, re, stat, threading, time, unicodedata, uuid
+from functools import wraps
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -60,6 +61,50 @@ class _SubtitleText:
         return self.text
 def _crop_output(rect):
     return dict(zip(("x", "y", "width", "height"), rect)) if rect is not None else None
+def _subtitle_snapshot(policy, path):
+    """Shared bounded read/parser/cue rules for set_subtitles and project import."""
+    with ap.open_authorized_media(policy, path, kind="subtitle") as (fd, canonical, identity):
+        try: text, digest, size = ap.read_subtitle_snapshot(fd, identity)
+        except OSError:
+            raise ap.AgentError("INVALID_SUBTITLE", "Authorized subtitle snapshot could not be read.") from None
+    cues = parse_sub_cues(_SubtitleText(text))
+    if not cues:
+        raise ap.AgentError("INVALID_SUBTITLE", "No valid SRT/VTT cue; check timestamps use hh:mm:ss,mmm / hh:mm:ss.mmm, then call cove_set_subtitles.")
+    if len(cues) > ap.MAX_SUBTITLE_CUES or any(len(c[2]) > ap.MAX_SUBTITLE_CUE_CHARS or c[1] > ap.MAX_TIMELINE for c in cues):
+        raise ap.AgentError("LIMIT_EXCEEDED", "Subtitle exceeds 5000 cues, 1000 characters/cue or 86400 cue-end seconds.")
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    skipped = sum("-->" in b for b in re.split(r"\n\n+", normalized.strip())) - len(cues)
+    snapshot = dict(identity=identity, sha256=digest, size_bytes=size, cue_count=len(cues),
+        first_cue_s=min(c[0] for c in cues), last_cue_s=max(c[1] for c in cues), skipped_cue_blocks=skipped)
+    return canonical, cues, snapshot
+def _import_hook(stage):
+    """Deterministic import race/failure seam; production has no hook behavior."""
+def _import_refusals(method):
+    """Bound import-only recovery text; preserve application codes and field labels."""
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        try: return method(self, *args, **kwargs)
+        except ap.AgentError as exc:
+            if exc.code == "NOT_CONFIGURED":
+                text = exc.message.lower()
+                flag = "--project-root" if "project-root" in text else "--output-root" if "output" in text else "--media-root"
+                action = f"Operator must restart with {flag}, then retry."
+            elif exc.code == "PATH_NOT_AUTHORIZED":
+                flag = "--project-root (project_roots)" if "project_roots" in exc.message else "--media-root (media_roots)"
+                action = f"Operator must restart with {flag}, then retry."
+            elif exc.code == "UNSUPPORTED_PROJECT_FEATURE":
+                action = "Operator: Remove or replace it in Cove, save, then retry."
+            elif exc.code == "FILE_NOT_FOUND":
+                action = "Operator: restore the missing file locally, then retry."
+            elif exc.code == "OUTPUT_UNSAFE":
+                action = "Operator: fix --output-root permissions, then retry."
+            elif exc.code == "INVALID_ARGUMENT":
+                action = "Agent: correct the project path or name, then retry."
+            else: action = "Operator: correct the source project locally, save, then retry."
+            suffix = " Nothing was changed."
+            message = action + " " + exc.message[:240-len(action)-len(suffix)-1] + suffix
+            raise ap.AgentError(exc.code, message) from None
+    return call
 class AgentSession:
     def __init__(self, policy: ap.PathPolicy):
         self.policy = policy
@@ -86,11 +131,11 @@ class AgentSession:
     def capabilities(self) -> dict:
         return dict(operations=["cove_" + s for s in ("get_capabilities", "inspect_media", "create_project",
             "import_media", "set_timeline", "get_project", "save_project", "start_export",
-            "get_export_status", "cancel_export", "set_audio", "set_audio_mix", "set_subtitles", "set_crop")], media_kinds=["video", "audio"],
+            "get_export_status", "cancel_export", "set_audio", "set_audio_mix", "set_subtitles", "set_crop", "open_project")], media_kinds=["video", "audio"],
             extensions=sorted(ap.EXTENSIONS), audio_extensions=sorted(ap.AUDIO_EXTENSIONS),
             subtitle_extensions=sorted(ap.SUBTITLE_EXTENSIONS),
-            supported=["video timeline", "background audio", "mix controls", "save", "export", "subtitles", "clip crop"],
-            deferred=["open_project"], media_roots=list(self.policy.media_roots),
+            supported=["video timeline", "background audio", "mix controls", "save", "export", "subtitles", "clip crop", "project copy import"],
+            deferred=[], media_roots=list(self.policy.media_roots), project_roots=list(self.policy.project_roots),
             output_root=self.policy.output_root, limits=ap.LIMITS, save_policy="immutable revisions",
             publication="descriptor-relative hard link", export=self.exports.capabilities())
     def _project(self, pid: str) -> Project:
@@ -178,6 +223,92 @@ class AgentSession:
             p.state, p.identities = candidate, identities
             p.revision += bool(added)
             return dict(assets=results, added=added, revision=p.revision)
+    @_import_refusals
+    def open_project(self, path: str, name=None) -> dict:
+        from . import agent_imports as ai
+        if not self.policy.project_roots:
+            raise ap.AgentError("NOT_CONFIGURED", "Configure --project-root to import .coveproj files.")
+        if self.policy.output_fd is None:
+            raise ap.AgentError("NOT_CONFIGURED", "Configure --output-root to create the imported copy.")
+        with ap.open_authorized_project(self.policy, path) as (fd, source, identity):
+            ai.validate_output_path(source, "project.path")
+            data, digest, size = ap.read_project_snapshot(fd, identity)
+        if name is None:
+            name = "".join(c for c in Path(source).stem if not unicodedata.category(c).startswith("C"))[:ap.MAX_NAME] or "Project"
+        if (type(name) is not str or not 1 <= len(name) <= ap.MAX_NAME
+                or any(unicodedata.category(c).startswith("C") for c in name)):
+            raise ap.AgentError("INVALID_ARGUMENT", "Use a name of 1–80 characters without controls.")
+        state = ai.parse_project_snapshot(data)
+        references, canonicalized = [], 0
+        # Authorize ALL references first. No reference descriptor/probe/read here.
+        for kind, fieldname, raw in ai.enumerate_references(state):
+            with _context(fieldname):
+                ai.reference_text(raw, fieldname)
+                canonical = ap.authorize_media_path(self.policy, raw, kind)
+                ai.validate_output_path(canonical, fieldname)
+            references.append((kind, fieldname, canonical))
+            canonicalized += canonical != raw
+        _import_hook("authorized")
+        identities, audio_identities, snapshots = {}, {}, {}
+        deadline = time.monotonic() + ap.PROBE_BUDGET
+        items = [*state.assets, *state.added_audios, *state.subtitles]
+        for item, (kind, fieldname, canonical) in zip(items, references):
+            with _context(fieldname):
+                if kind == "subtitle":
+                    canonical, item.cues, snapshots[item.id] = _subtitle_snapshot(self.policy, canonical)
+                else:
+                    canonical, identity, info = self._probe(canonical, deadline, kind=kind)
+                    ai.validate_metadata(item, info, fieldname)
+                    if kind == "video":
+                        identities[item.id] = identity
+                        for i, c in enumerate(state.clips):
+                            if c.asset is item and c.src_end > info["duration_s"] + ai.DURATION_TOLERANCE:
+                                raise ap.AgentError("PROJECT_REFERENCE_INVALID", f"clips[{i}].src_end: exceeds probed duration.")
+                    else:
+                        audio_identities[item.id] = identity
+                        if item.src_end > info["duration_s"] + ai.DURATION_TOLERANCE:
+                            raise ap.AgentError("PROJECT_REFERENCE_INVALID", fieldname.replace("path","src_end")+": exceeds probed duration.")
+                item.path = Path(canonical)
+        state = _validated(state)
+        warnings = []
+        if canonicalized: warnings.append(f"Canonicalized {canonicalized} symlink references within authorized media roots.")
+        for s in state.subtitles:
+            if snapshots[s.id]["skipped_cue_blocks"]:
+                warnings.append(f"Subtitle track {s.id}: skipped {snapshots[s.id]['skipped_cue_blocks']} malformed cue blocks.")
+        end = max((c.timeline_end for c in state.clips), default=0)
+        for i, a in enumerate(state.added_audios):
+            if a.offset >= end: warnings.append(f"added_audio[{i}]: starts at/after timeline end; move it earlier before saving.")
+        result = dict(name=name, revision=1, saved_revision=None,
+            imported=dict(source_path=source, source_sha256=digest, source_size_bytes=size, schema_version=1, copy_on_import=True),
+            counts=dict(assets=len(state.assets), video_clips=len(state.clips), audio_items=len(state.added_audios),
+                subtitle_tracks=len(state.subtitles), cropped_clips=sum(c.crop_rect is not None for c in state.clips)),
+            crops=[dict(clip_id=c.id, crop=_crop_output(c.crop_rect)) for c in state.clips if c.crop_rect is not None],
+            warnings=warnings[:ap.MAX_WARNINGS])
+        with self.lock:
+            if self.closing: raise ap.AgentError("SHUTTING_DOWN", "Ask the operator to restart the server.")
+            if len(self.projects) >= ap.MAX_PROJECTS: raise ap.AgentError("LIMIT_EXCEEDED", "Session project limit reached.")
+            pid = uuid.uuid4().hex
+            slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:60] or "project"
+            dirname = slug + "-" + pid
+            response = dict(project_id=pid, **result)
+            fd = owned = None
+            try:
+                fd = ap.create_project_dir(self.policy, dirname)
+                owned = ap.file_identity(os.fstat(fd))[:2]
+                _import_hook("allocated")
+                project = Project(name, slug, dirname, fd, state, identities, audio_identities, snapshots, revision=1)
+                self.projects[pid] = project
+                return response
+            except BaseException as exc:
+                if fd is not None:
+                    try:
+                        if owned is None or ap.file_identity(os.stat(dirname, dir_fd=self.policy.output_fd, follow_symlinks=False))[:2] == owned:
+                            os.rmdir(dirname, dir_fd=self.policy.output_fd)
+                    except OSError: pass
+                    finally: os.close(fd)
+                if isinstance(exc, OSError):
+                    raise ap.AgentError("OUTPUT_UNSAFE", "Could not acquire the imported project directory.") from None
+                raise
     def set_timeline(self, project_id: str, placement: str, clips: list[dict]) -> dict:
         if placement not in ("sequential", "explicit") or type(clips) is not list:
             raise ap.AgentError("INVALID_ARGUMENT", "Use sequential or explicit placement and a clip list.")
@@ -327,18 +458,9 @@ class AgentSession:
                     raise ap.AgentError("INVALID_ARGUMENT", "position must be bottom or top.")
                 if style["active"] and any(s.active for s in subtitles):
                     raise ap.AgentError("INVALID_ARGUMENT", "At most one subtitle track may be active.")
-                with ap.open_authorized_media(self.policy, item["path"], kind="subtitle") as (fd, path, identity):
-                    text, digest, size = ap.read_subtitle_snapshot(fd, identity)
-                cues = parse_sub_cues(_SubtitleText(text))
-                if not cues:
-                    raise ap.AgentError("INVALID_SUBTITLE", "No valid SRT/VTT cue; check timestamps use hh:mm:ss,mmm / hh:mm:ss.mmm, then call cove_set_subtitles.")
-                if len(cues) > ap.MAX_SUBTITLE_CUES or any(len(c[2]) > ap.MAX_SUBTITLE_CUE_CHARS or c[1] > ap.MAX_TIMELINE for c in cues):
-                    raise ap.AgentError("LIMIT_EXCEEDED", "Subtitle exceeds 5000 cues, 1000 characters/cue or 86400 cue-end seconds.")
+                path, cues, snapshot = _subtitle_snapshot(self.policy, item["path"])
                 sub = SubtitleTrack(Path(path), **style, cues=cues, id=uuid.uuid4().hex)
-                normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-                skipped = sum("-->" in block for block in re.split(r"\n\n+", normalized.strip())) - len(cues)
-                snapshots[sub.id] = dict(identity=identity, sha256=digest, size_bytes=size, cue_count=len(cues),
-                    first_cue_s=min(c[0] for c in cues), last_cue_s=max(c[1] for c in cues), skipped_cue_blocks=skipped)
+                snapshots[sub.id] = snapshot
                 subtitles.append(sub)
         with self.lock:
             p = self._project(project_id)
@@ -384,7 +506,7 @@ class AgentSession:
                     warnings.append(f"Gap from {cursor:g} to {c.timeline_start:g} seconds.")
                 if not c.asset.has_audio and (c.audio_volume != 1 or c.muted) and len(warnings) < ap.MAX_WARNINGS:
                     warnings.append(f"clips[{i}]: source has no audio; volume/mute have no effect.")
-                cursor = c.timeline_end
+                cursor = max(cursor, c.timeline_end)
                 clips.append(dict(clip_id=c.id, asset_id=c.asset.id, src_start_s=c.src_start, src_end_s=c.src_end,
                     crop=_crop_output(c.crop_rect), crop_pixels=_crop_output(effective_clip_crop_pixels(c)),
                     speed=c.speed, volume=c.audio_volume, mute=c.muted,

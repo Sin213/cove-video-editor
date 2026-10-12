@@ -14,6 +14,7 @@ AUDIO_EXTENSIONS = frozenset({".mp3", ".m4a", ".aac", ".wav", ".ogg", ".opus", "
 SUBTITLE_EXTENSIONS = frozenset({".srt", ".vtt"})
 MAX_SUBTITLE_TRACKS, MAX_SUBTITLE_BYTES, MAX_SUBTITLE_CUES, MAX_SUBTITLE_CUE_CHARS = 8, 1048576, 5000, 1000
 MAX_AUDIO_ITEMS, MAX_AUDIO_LANE = 50, 63
+MAX_PROJECT_BYTES = 4194304
 INPUT_OPTIONS = ("-protocol_whitelist", "file", "-format_whitelist",
                  "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi")
 AUDIO_INPUT_OPTIONS = (*INPUT_OPTIONS[:-1], INPUT_OPTIONS[-1] + ",mp3,wav,flac,ogg,aac")
@@ -23,16 +24,18 @@ ERROR_CODES = frozenset("INVALID_ARGUMENT NOT_CONFIGURED PATH_NOT_AUTHORIZED FIL
     "ASSET_NOT_VIDEO INVALID_TIMELINE EMPTY_TIMELINE ASSET_CHANGED DESTINATION_EXISTS "
     "OUTPUT_FILESYSTEM_UNSUPPORTED OUTPUT_UNSAFE PROJECT_CHANGED_ON_DISK INTERNAL_ERROR "
     "EXPORT_BUSY PROJECT_NOT_SAVED UNKNOWN_EXPORT EXPORT_FAILED EXPORT_TIMEOUT "
-    "EXPORT_OUTPUT_INVALID SHUTTING_DOWN INVALID_SUBTITLE UNKNOWN_CLIP REVISION_MISMATCH INVALID_CROP".split())
+    "EXPORT_OUTPUT_INVALID SHUTTING_DOWN INVALID_SUBTITLE UNKNOWN_CLIP REVISION_MISMATCH INVALID_CROP "
+    "INVALID_PROJECT UNSUPPORTED_PROJECT_FEATURE PROJECT_REFERENCE_INVALID".split())
 LIMITS = dict(paths=MAX_PATHS, path_chars=MAX_PATH_CHARS, name_chars=MAX_NAME,
     projects=MAX_PROJECTS, assets=MAX_ASSETS, clips=MAX_CLIPS, timeline_s=MAX_TIMELINE,
     probe_timeout_s=PROBE_TIMEOUT, probe_budget_s=PROBE_BUDGET,
     probe_output_bytes=PROBE_OUTPUT_CAP, warnings=MAX_WARNINGS,
     audio_items=MAX_AUDIO_ITEMS, audio_lane_max=MAX_AUDIO_LANE, subtitle_tracks=MAX_SUBTITLE_TRACKS,
-    subtitle_bytes=MAX_SUBTITLE_BYTES, subtitle_cues=MAX_SUBTITLE_CUES, subtitle_cue_chars=MAX_SUBTITLE_CUE_CHARS)
+    subtitle_bytes=MAX_SUBTITLE_BYTES, subtitle_cues=MAX_SUBTITLE_CUES, subtitle_cue_chars=MAX_SUBTITLE_CUE_CHARS,
+    project_bytes=MAX_PROJECT_BYTES)
 class AgentError(Exception):
     def __init__(self, code: str, message: str):
-        if code == "PATH_NOT_AUTHORIZED" and "See cove_get_capabilities media_roots." not in message:
+        if code == "PATH_NOT_AUTHORIZED" and "See cove_get_capabilities" not in message:
             message += " See cove_get_capabilities media_roots."
         self.code, self.message = code, message[:240]
         super().__init__(f"{code}: {self.message}")
@@ -41,6 +44,7 @@ class PathPolicy:
     media_roots: tuple[str, ...]
     output_root: str | None
     output_fd: int | None
+    project_roots: tuple[str, ...] = ()
     def close(self) -> None:
         if self.output_fd is not None:
             os.close(self.output_fd)
@@ -51,16 +55,18 @@ def reject_unsafe_path_text(path: str) -> str:
             or path.startswith("//") or not os.path.isabs(path)):
         raise AgentError("INVALID_ARGUMENT", "Use a bounded absolute local path.")
     return path
-def validate_roots(media_roots=(), output_root=None) -> PathPolicy:
+def validate_roots(media_roots=(), output_root=None, project_roots=()) -> PathPolicy:
     roots = []
-    for flag, raw in [("--media-root", r) for r in media_roots] + ([("--output-root", output_root)] if output_root is not None else []):
+    entries = ([("--media-root", r) for r in media_roots] + [("--project-root", r) for r in project_roots]
+               + ([("--output-root", output_root)] if output_root is not None else []))
+    for flag, raw in entries:
         try:
             canonical = os.path.realpath(reject_unsafe_path_text(raw))
             reason = "is the filesystem root" if canonical == "/" else ("does not exist" if not os.path.exists(canonical) else ("not a directory" if not os.path.isdir(canonical) else None))
         except (ValueError, OSError, AgentError):
             reason = 'contains ":" or "\\", which is not supported' if type(raw) is str and (":" in raw or "\\" in raw) else "not an absolute path"
         if reason:
-            raise AgentError("INVALID_ARGUMENT" if flag == "--media-root" else "OUTPUT_UNSAFE", f"{flag} {repr(raw)[:200]}: {reason}") from None
+            raise AgentError("OUTPUT_UNSAFE" if flag == "--output-root" else "INVALID_ARGUMENT", f"{flag} {repr(raw)[:200]}: {reason}") from None
         roots.append(canonical)
     if sys.platform != "linux":
         raise AgentError("OUTPUT_UNSAFE", "UNSUPPORTED_PLATFORM: Linux is required.")
@@ -69,15 +75,16 @@ def validate_roots(media_roots=(), output_root=None) -> PathPolicy:
         fd = os.open(output, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC) if output else None
     except OSError:
         raise AgentError("OUTPUT_UNSAFE", f"--output-root {repr(output_root)[:180]}: cannot be opened (check permissions)") from None
-    return PathPolicy(tuple(dict.fromkeys(roots)), output, fd)
+    return PathPolicy(tuple(dict.fromkeys(roots[:len(media_roots)])), output, fd,
+                      tuple(dict.fromkeys(roots[len(media_roots):])))
 def _contained(path: str, roots: tuple[str, ...]) -> bool:
     return any(os.path.commonpath([path, root]) == root for root in roots)
 def file_identity(st) -> tuple[int, int, int, int]:
     return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns
 def _media_hook(stage: str) -> None:
     """Deterministic race seam; production has no hook behavior."""
-@contextmanager
-def open_authorized_media(policy: PathPolicy, path: str, *, kind: str = "video"):
+def authorize_media_path(policy: PathPolicy, path: str, kind: str = "video") -> str:
+    """Authorize text/containment/extension without opening or probing the file."""
     if kind not in {"video", "audio", "subtitle"}:
         raise AgentError("INVALID_ARGUMENT", "Use video, audio or subtitle media.")
     reject_unsafe_path_text(path)
@@ -97,6 +104,9 @@ def open_authorized_media(policy: PathPolicy, path: str, *, kind: str = "video")
             if suffix in {".ass", ".ssa"}:
                 message += " Cove renders only parsed SRT/VTT cues; .ass/.ssa are unsupported."
         raise AgentError("UNSUPPORTED_EXTENSION", message)
+    return canonical
+@contextmanager
+def _open_authorized(canonical, roots, label, hint):
     _media_hook("before_open")
     try:
         # Open once; O_NOFOLLOW refuses a symlink swapped in after authorization.
@@ -104,19 +114,54 @@ def open_authorized_media(policy: PathPolicy, path: str, *, kind: str = "video")
     except FileNotFoundError:
         raise AgentError("FILE_NOT_FOUND", "Authorized file does not exist.") from None
     except OSError:
-        raise AgentError("PATH_NOT_AUTHORIZED", "Cannot open media safely.") from None
+        raise AgentError("PATH_NOT_AUTHORIZED", f"Cannot open {label} safely. See cove_get_capabilities {hint}.") from None
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
-            raise AgentError("NOT_A_REGULAR_FILE", "Media must be a regular file.")
+            raise AgentError("NOT_A_REGULAR_FILE", f"{label} must be a regular file.")
         _media_hook("after_open")
         location = os.readlink(f"/proc/self/fd/{fd}")
         # /proc checks the inode's real location after parent-directory swaps.
-        if not _contained(location.removesuffix(" (deleted)"), policy.media_roots):
-            raise AgentError("PATH_NOT_AUTHORIZED", "Opened file left authorized roots.")
+        if not _contained(location.removesuffix(" (deleted)"), roots):
+            raise AgentError("PATH_NOT_AUTHORIZED", f"Opened file left authorized roots. See cove_get_capabilities {hint}.")
         yield fd, canonical, file_identity(st)
     finally:
         os.close(fd)
+@contextmanager
+def open_authorized_media(policy: PathPolicy, path: str, *, kind: str = "video"):
+    canonical = authorize_media_path(policy, path, kind)
+    with _open_authorized(canonical, policy.media_roots, "Media", "media_roots") as opened:
+        yield opened
+@contextmanager
+def open_authorized_project(policy: PathPolicy, path: str):
+    reject_unsafe_path_text(path)
+    if os.path.normpath(path) != path:
+        raise AgentError("INVALID_ARGUMENT", "Project path must be normalized and absolute.")
+    if not policy.project_roots:
+        raise AgentError("NOT_CONFIGURED", "Configure --project-root at startup to read .coveproj files.")
+    canonical = os.path.realpath(path)
+    if not _contained(canonical, policy.project_roots):
+        raise AgentError("PATH_NOT_AUTHORIZED", "Project path is outside authorized roots. See cove_get_capabilities project_roots.")
+    if Path(canonical).suffix.lower() != ".coveproj":
+        raise AgentError("UNSUPPORTED_EXTENSION", "Project path must end in .coveproj.")
+    with _open_authorized(canonical, policy.project_roots, "Project", "project_roots") as opened:
+        yield opened
+def read_project_snapshot(fd: int, identity: tuple) -> tuple[bytes, str, int]:
+    """Bounded snapshot of the held project descriptor, with identity rechecks."""
+    if file_identity(os.fstat(fd)) != identity:
+        raise AgentError("ASSET_CHANGED", "Project changed before reading.")
+    if identity[2] > MAX_PROJECT_BYTES:
+        raise AgentError("LIMIT_EXCEEDED", "Project exceeds 4 MiB.")
+    data = bytearray()
+    while len(data) <= MAX_PROJECT_BYTES:
+        chunk = os.read(fd, min(65536, MAX_PROJECT_BYTES + 1 - len(data)))
+        if not chunk: break
+        data.extend(chunk)
+    if file_identity(os.fstat(fd)) != identity:
+        raise AgentError("ASSET_CHANGED", "Project changed while reading.")
+    if len(data) > MAX_PROJECT_BYTES:
+        raise AgentError("LIMIT_EXCEEDED", "Project exceeds 4 MiB.")
+    return bytes(data), hashlib.sha256(data).hexdigest(), len(data)
 def read_subtitle_snapshot(fd: int, identity: tuple) -> tuple[str, str, int]:
     """Read bounded bytes from the authorized held fd, never reopen its path."""
     if file_identity(os.fstat(fd)) != identity:
@@ -256,12 +301,17 @@ def create_project_dir(policy: PathPolicy, name: str) -> int:
         raise AgentError("NOT_CONFIGURED", "Configure an output root at startup.")
     if not re.fullmatch(r"[a-zA-Z0-9_-]{1,150}", name):
         raise AgentError("OUTPUT_UNSAFE", "Invalid project directory name.")
+    created = False
     try:
         # Exclusive mkdir anchored to the startup descriptor never follows existing paths.
         os.mkdir(name, mode=0o777, dir_fd=policy.output_fd)
+        created = True
         return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
                        dir_fd=policy.output_fd)
     except OSError:
+        if created:
+            try: os.rmdir(name, dir_fd=policy.output_fd)
+            except OSError: pass  # Never recursively remove a changed/nonempty name.
         raise AgentError("OUTPUT_UNSAFE", "Cannot create an exclusive project directory.") from None
 def _publish_hook() -> None:
     """Seam between complete temporary write and no-clobber publication."""

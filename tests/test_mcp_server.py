@@ -26,7 +26,7 @@ def test_cli_permission_help_and_errors(tmp_path, capsys):
     assert exc.value.code == 0
     assert all(word in help_text for word in ("--media-root DIR", "--output-root DIR", "subfolders", "repeatable", "cannot widen", "exit 2", "exit 1"))
     file = tmp_path / "file"; file.touch()
-    for flag in ("--media-root", "--output-root"):
+    for flag in ("--media-root", "--output-root", "--project-root"):
         for value, reason in (("relative", "not an absolute path"), ("~/x", "not an absolute path"), (str(tmp_path / "missing"), "does not exist"), (str(file), "not a directory"), ("/", "is the filesystem root"), (str(tmp_path / "bad\nname"), "does not exist"), ("/tmp/a:b", 'contains ":" or "\\", which is not supported')):
             assert main([flag, value]) == 2
             err = capsys.readouterr().err
@@ -45,7 +45,7 @@ def test_lazy_import():
     result = subprocess.run(["python3", "-c", "import sys; import cove_video_editor.app; assert 'mcp' not in sys.modules"],
                             env=env, capture_output=True, timeout=15)
     assert result.returncode == 0 and not result.stdout
-@pytest.mark.parametrize("roots", [(), ("--media-root",), ("--output-root",), ("--media-root", "--output-root")])
+@pytest.mark.parametrize("roots", [(), ("--media-root",), ("--output-root",), ("--media-root", "--output-root"), ("--media-root", "--output-root", "--project-root")])
 def test_startup_permission_notice(tmp_path, monkeypatch, capsys, roots):
     from cove_video_editor import mcp_server as module
     class Server:
@@ -54,7 +54,11 @@ def test_startup_permission_notice(tmp_path, monkeypatch, capsys, roots):
     monkeypatch.setattr(module, "build_server", lambda session: Server())
     assert module.main([arg for flag in roots for arg in (flag, str(tmp_path))]) == 0
     captured = capsys.readouterr()
-    assert not captured.out and captured.err.count("Notice:") == (len(roots) < 2)
+    assert not captured.out and captured.err.count("Notice:") == (len(roots) < 3)
+    for flag in ("--media-root", "--project-root", "--output-root"):
+        assert (flag in captured.err) == (flag not in roots)
+    if "--project-root" not in roots:
+        assert "needed only to import existing projects" in captured.err
 @pytest.mark.parametrize('mode', ['before', 'cleanup', 'cleanup_twice', 'failed', 'failed_signal'])
 def test_signal_exit_after_cleanup(monkeypatch, mode):
     import threading
@@ -152,7 +156,7 @@ def test_tools_and_workflow(tmp_path, transport):
                 tools = (await client.list_tools()).tools
                 names = {t.name for t in tools}
                 assert names == {"cove_" + n for n in ("get_capabilities", "inspect_media", "create_project",
-                    "import_media", "set_timeline", "get_project", "save_project", "start_export", "get_export_status", "cancel_export", "set_audio", "set_audio_mix", "set_subtitles", "set_crop")}
+                    "import_media", "set_timeline", "get_project", "save_project", "start_export", "get_export_status", "cancel_export", "set_audio", "set_audio_mix", "set_subtitles", "set_crop", "open_project")}
                 assert all(t.input_schema.get("additionalProperties") is False and t.output_schema for t in tools)
                 assert all(len(t.description) >= 80 for t in tools)
                 schemas = {t.name: t.input_schema for t in tools}
@@ -324,7 +328,7 @@ def test_sdk_stdio_export_audio_oracle(tmp_path):
         with anyio.fail_after(25):
             async with stdio_client(params) as streams, ClientSession(*streams, read_timeout_seconds=10) as client:
                 await client.initialize()
-                assert len((await client.list_tools()).tools) == 14
+                assert len((await client.list_tools()).tools) == 15
                 async def call(name, /, **args):
                     result = await client.call_tool('cove_' + name, args)
                     assert not result.is_error, result
@@ -607,7 +611,7 @@ def test_sdk_stdio_background_audio_snapshot(tmp_path):
             async with stdio_client(params) as streams, ClientSession(*streams, read_timeout_seconds=10) as client:
                 await client.initialize()
                 tools = (await client.list_tools()).tools
-                assert len(tools) == 14
+                assert len(tools) == 15
                 schemas = {t.name:t.input_schema for t in tools}
                 fields = schemas['cove_set_audio']['$defs']['AudioItem']['properties']
                 assert all(fields[n].get('description') for n in fields)
@@ -687,7 +691,7 @@ def test_sdk_subtitle_crop_workflow(tmp_path,monkeypatch,transport):
     async def protocol():
         with anyio.fail_after(45):
             async with connect() as client:
-                tools=(await client.list_tools()).tools; assert len(tools)==14
+                tools=(await client.list_tools()).tools; assert len(tools)==15
                 schemas={t.name:t.input_schema for t in tools}
                 active=schemas['cove_set_subtitles']['$defs']['SubtitleTrackInput']['properties']['active']
                 assert active['default'] is True and 'defaults to true' in active['description']
