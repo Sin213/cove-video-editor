@@ -299,6 +299,29 @@ python3 -m venv .venv
 PYTHONPATH=src .venv/bin/python -m cove_video_editor
 ```
 
+### Open a project from the command line
+
+Run these examples from the repository checkout root (`PYTHONPATH=src` uses its
+`src` directory). They use Linux/macOS shell syntax and were exercised only on
+Linux. If you installed dependencies in the project venv, replace `python3`
+with `.venv/bin/python`.
+
+```bash
+PYTHONPATH=src python3 -m cove_video_editor --project "/absolute/path/my project.coveproj"
+PYTHONPATH=src python3 -m cove_video_editor --project="/absolute/path/my project.coveproj"
+PYTHONPATH=src python3 -m cove_video_editor --help
+```
+
+Relative paths use the directory where you launch Cove. For a filename starting
+with `-`, use the equals form: `--project=-draft.coveproj`. Starting without
+arguments still works; each run starts a separate Cove process. Qt options such
+as `-platform offscreen`, `--platform offscreen` and `-style fusion` pass through.
+Unknown options or stray arguments are rejected with exit code 2.
+
+You can also use **Project -> Open Project...** in the GUI. GUI **Save** overwrites
+the opened file; use **Project -> Save As** to keep an MCP-generated revision.
+MCP revisions are immutable/no-clobber only under the MCP publication contract.
+
 ---
 
 ## Running from source (Windows)

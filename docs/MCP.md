@@ -220,6 +220,11 @@ in place, never copied: keep source videos, audio and subtitle files where they 
 via exclusive temp + descriptor-relative hard link. Earlier revisions are never
 overwritten. Unchanged saves verify the recorded hash; external changes are
 refused. Open the returned saved .coveproj using Project (menu button) -> Open Project..., rather than 'Add media files'.
+Alternatively, run `PYTHONPATH=src python3 -m cove_video_editor --project "/absolute/path/revision.coveproj"`.
+Run this from the repository checkout root so `PYTHONPATH=src` finds its `src` directory.
+This is Linux/macOS shell syntax, exercised only on Linux; for the project venv,
+replace `python3` with `.venv/bin/python`.
+GUI Save overwrites that file; use Project -> Save As to preserve the MCP revision.
 
 Errors use bounded text and structured application errors; protocol errors remain SDK-owned.
 
@@ -276,6 +281,11 @@ Verify: ask the agent to call `cove_get_capabilities`; check `media_roots`/`outp
 After export: open the saved .coveproj via Project (menu button) -> Open Project...,
 never 'Add media files'. Play the MP4 at output.path in any media player;
 'Add media files' may import that MP4 into Cove as a clip.
+Alternatively, open the project with `PYTHONPATH=src python3 -m cove_video_editor --project "/absolute/path/revision.coveproj"`.
+Run this from the repository checkout root so `PYTHONPATH=src` finds its `src` directory.
+This is Linux/macOS shell syntax, exercised only on Linux; for the project venv,
+replace `python3` with `.venv/bin/python`.
+Use Project -> Save As to preserve the MCP revision; GUI Save overwrites the opened file.
 
 For an existing project, manually verify this sequence:
 1. Check capabilities for project_roots, media_roots and output_root. Record the

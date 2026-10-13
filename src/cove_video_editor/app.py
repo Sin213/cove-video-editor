@@ -32,6 +32,7 @@ from PySide6.QtGui import (
     QFontMetricsF,
     QIcon,
     QImage,
+    Qt as GuiQt,
     QKeySequence,
     QMouseEvent,
     QPainter,
@@ -1653,6 +1654,40 @@ class MainWindow(QMainWindow):
         self.export_log.append(f"{headline}: {text}")
         QMessageBox.warning(self, headline, text)
 
+    def open_startup_project(self, path: Path) -> None:
+        """Open on the first event-loop pass, after the caller shows the window.
+
+        A parented timer works on the minimum supported PySide6, and is
+        destroyed with the window if the event loop has not delivered it.
+        """
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+
+        def open_project() -> None:
+            try:
+                self._open_project_path(path)
+            finally:
+                timer.deleteLater()
+
+        timer.timeout.connect(open_project)
+        timer.start(0)
+
+    def _refresh_window_title(self) -> None:
+        path = self._current_project_path
+        self.titlebar.title_lbl.setTextFormat(Qt.PlainText)
+        if path is None:
+            self.setWindowTitle(f"Cove Video Editor v{__version__}")
+            self.titlebar.title_lbl.setText("Cove Video Editor")
+            self.titlebar.title_lbl.setToolTip("")
+        else:
+            title = f"{path.name} — Cove Video Editor"
+            self.setWindowTitle(title)
+            self.titlebar.title_lbl.setText(title)
+            full_path = str(path)
+            tooltip = (GuiQt.convertFromPlainText(full_path)
+                       if GuiQt.mightBeRichText(full_path) else full_path)
+            self.titlebar.title_lbl.setToolTip(tooltip)
+
     def _save_project_to(self, path: Path) -> bool:
         """Serialize the session to ``path``. Returns True on success.
 
@@ -1668,6 +1703,7 @@ class MainWindow(QMainWindow):
             self._report_project_problem("Could not save project", exc)
             return False
         self._current_project_path = path
+        self._refresh_window_title()
         self.status.showMessage(f"Project saved: {path.name}", 5000)
         return True
 
@@ -1715,6 +1751,7 @@ class MainWindow(QMainWindow):
             return False
         self._apply_project_state(state)
         self._current_project_path = path
+        self._refresh_window_title()
         self.status.showMessage(f"Project opened: {path.name}", 5000)
         return True
 
