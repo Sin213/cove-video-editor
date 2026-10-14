@@ -13,11 +13,32 @@ artifacts via GitHub Actions.
 ![Python](https://img.shields.io/badge/python-3.10%2B-orange?style=flat-square&logo=python)
 ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-informational?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
-![Version](https://img.shields.io/badge/release-v2.2.0-5eead4?style=flat-square)
+![Version](https://img.shields.io/badge/release-v2.5.0-5eead4?style=flat-square)
 
-![Cove Video Editor v2.2.0](docs/screenshot.png)
+![Cove Video Editor](docs/screenshot.png)
 
 ---
+
+## What's new in v2.5.0
+
+- **Local MCP server (optional)** - `cove-video-editor-mcp` lets an AI agent
+  create projects, import media, build the timeline, set added audio, the
+  audio mix, subtitles and per-clip crop, save immutable `.coveproj`
+  revisions and run exports with progress and cancellation. Access is limited
+  to the media, project and output folders you pass on the command line.
+  Existing projects are imported as new copies; originals are never modified.
+  Source installs only (`pip install '.[mcp]'`); see [docs/MCP.md](docs/MCP.md).
+- **Open a project from the command line** - `--project <file>` opens a
+  `.coveproj` on launch. See
+  [Open a project from the command line](#open-a-project-from-the-command-line).
+- **Downloader cookie authentication (opt-in)** - use cookies from a browser
+  or a cookies file for sites that need a login. Cookie paths and values are
+  redacted from logs and errors.
+- **Pinned, verified yt-dlp** - builds bundle yt-dlp 2026.08.19 checked against
+  a SHA-256 pin, with an option to pick your own local yt-dlp executable.
+- **Updater fixes** - closing the app during an update check or download no
+  longer hangs, stalled downloads are bounded by a deadline, and a cancelled or
+  failed download never replaces the installed app.
 
 ## What's new in v2.2.0
 
@@ -411,11 +432,15 @@ src/cove_video_editor/
 ├── exporter.py        ffmpeg filtergraph + ASS writer + progress loop
 ├── ffmpeg_utils.py    ffprobe wrapper + format table + binary resolution
 ├── updater.py         GitHub releases poll + AppImage in-place swap
+├── downloader.py      yt-dlp download dialog + pinned binary verification
+├── mcp_server.py      optional local MCP server (stdio)
+├── agent_*.py         MCP sessions, path permissions, imports, exports
 └── assets/            icon
 
 packaging/
 ├── installer.iss                  Inno Setup script
 ├── launcher.py                    PyInstaller entry point
+├── yt-dlp-pins.json               pinned yt-dlp release + SHA-256 per platform
 └── cove-video-editor.desktop      Linux desktop entry
 
 build.ps1                          Windows Setup.exe + Portable.exe builder
