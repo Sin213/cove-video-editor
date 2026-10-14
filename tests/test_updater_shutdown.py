@@ -439,17 +439,17 @@ upd.urllib.request.urlopen = lambda *a, **k: Response()
 thread, worker = upd.start_download('https://invalid/asset', Path(sys.argv[2])/'partial')
 thread.start()
 assert entered.wait(1)
-appmod._CLOSE_JOIN_MS = 20
+appmod._CLOSE_JOIN_MS = 200
 start = time.monotonic()
 appmod._join_or_survive(thread, worker)
 park_duration = time.monotonic()-start
 start = time.monotonic()
 if sys.argv[1] == 'drain':
-    appmod.drain_surviving_media_threads(20)
+    appmod.drain_surviving_media_threads(200)
     remaining = list(appmod._SURVIVING_MEDIA_THREADS)
 else:
     shutdown = getattr(upd, 'shutdown_update_threads', None)
-    remaining = shutdown(20) if shutdown else []
+    remaining = shutdown(200) if shutdown else []
 duration = time.monotonic()-start
 running = thread.isRunning()
 worker.cancel()  # Cleanup must work even before the registry API exists.
@@ -639,23 +639,19 @@ def test_close_cancels_download_without_publication(case):
     assert row["elapsed"] < 2
     assert row["closes"][0]["duration"] < 1
     assert not row["download_exists"] and row["effects"] == []
-    assert row["closes"][0]["after_running"] is (case == "download_park")
+    assert not row["closes"][0]["after_running"]
 
 
 def test_download_socket_timeout_boundary_slow():
-    """Slow (~21s): one held read is covered, not DNS/trickle/sidecar stalls.
-
-    This is a bounded best-effort join, not an overall download guarantee.
-    Live pairs are retained, never terminated; exit can still abort (L3b/M5).
-    """
+    """A held 20.5 s read must not hold the QThread or shutdown open."""
     start = time.monotonic()
-    rows = run_child(GUI, "download_boundary", timeout=30)
-    assert time.monotonic() - start < 30  # real owned-process wall time
+    rows = run_child(GUI, "download_boundary", timeout=6)
+    assert time.monotonic() - start < 6
     close = returned(rows)["closes"][0]
     assert close["entered"] and close["running"] and close["progress_visible"]
-    assert close["after_running"] and close["duration"] < 2
+    assert not close["after_running"] and close["duration"] < 1
     final = next(row for row in rows if row["event"] == "download_exit")
-    assert final["join_ms"] >= 22_000  # margin above the 20 s socket timeout
+    assert final["join_ms"] == 22_000  # retained upper bound, not a required wait
     assert not final["download_exists"] and final["cache_files"] == []
     assert final["effects"] == []  # rc 0/no fatal/watchdog/lingering asserted by runner
 
@@ -686,11 +682,10 @@ def test_closing_blocks_download_callbacks(case):
 
 @pytest.mark.parametrize("case", ["drain", "registry"])
 def test_stalled_download_shutdown_budget(case):
-    # API-specific registry assertion; finite held socket model proves both
-    # drain and atexit join budgets without leaving a live Qt thread at exit.
+    # Cancel must finish the supervisor independently of the held body read.
     row = run_child(BOUNDED, case)[0]
-    assert row["park_duration"] < .2 and row["duration"] < .2
-    assert row["running"] and row["remaining"] == 1
+    assert row["park_duration"] < .5 and row["duration"] < .5
+    assert not row["running"] and row["remaining"] == 0
     assert not row["partial_exists"]
 
 

@@ -241,12 +241,10 @@ def drain_surviving_media_threads(timeout_ms: int = 8000) -> None:
     cancel is repeated here because a worker that had already re-entered
     ffmpeg still needs telling.
 
-    Update downloads can also be parked here. Their cancellation cannot
-    interrupt a socket read. The registry's 22 s atexit budget covers one 20 s
-    read timeout, not an overall download deadline: DNS, multi-address connects,
-    trickling buffered reads and sidecar fetching can outlast these best-effort
-    joins. Live pairs remain owned and are never terminated, but Qt teardown
-    can still abort at exit; L3b defers that download residual to follow-up M5.
+    Update workers can also be parked here. They poll cancellation every
+    ~25 ms; these joins and the registry's 22 s atexit budget are upper bounds.
+    Blocking daemon I/O has LOGICAL deadlines, holds no Qt objects, and cannot
+    publish after abandonment. Live Qt pairs stay owned and are never terminated.
     """
     deadline = time.monotonic() + max(0, timeout_ms) / 1000.0
     for thread, worker in list(_SURVIVING_MEDIA_THREADS):
@@ -1238,6 +1236,7 @@ class MainWindow(QMainWindow):
         self._update_worker = None
         self._update_download_thread: QThread | None = None
         self._update_download_worker = None
+        self._update_download_cancel_check = None
         self._update_progress: QProgressDialog | None = None
         self._update_prompt_shown = False
         # Kick off the first check a moment after the UI comes up so the
@@ -4982,11 +4981,10 @@ class MainWindow(QMainWindow):
         for worker in (self._update_worker, self._update_download_worker):
             if worker is not None:
                 worker.cancel()
-        # Update checks can stop waiting on DNS immediately. Download workers
-        # have no overall deadline (DNS, multi-address connects, trickling reads,
-        # sidecar fetch). Park for bounded best-effort drain/atexit joins; even
-        # the 22 s budget only covers one 20 s read timeout. A live pair remains
-        # owned, never terminated; exit can still abort (L3b; follow-up M5).
+        # Update workers poll cancel every ~25 ms, independently of daemon I/O.
+        # Drain/atexit joins are upper bounds. Logical deadlines do not cancel
+        # syscalls, but abandoned daemons hold no Qt objects and cannot publish.
+        # Keep any live Qt pair owned until stopped; never terminate it.
         for thread, worker in (
             (self._update_thread, self._update_worker),
             (self._update_download_thread, self._update_download_worker),
@@ -5187,7 +5185,9 @@ class MainWindow(QMainWindow):
         self._update_progress.setValue(0)
 
         thread, worker = updater.start_download(info.asset_url, dest)
-        self._update_progress.canceled.connect(worker.cancel)
+        self._update_progress.canceled.connect(worker.cancel, Qt.DirectConnection)
+        # Keep this plain Event reader after thread-done clears the worker field.
+        self._update_download_cancel_check = worker.is_cancelled
         worker.progress.connect(self._update_progress.setValue, Qt.QueuedConnection)
         worker.finished.connect(self._on_update_downloaded, Qt.QueuedConnection)
         worker.failed.connect(self._on_update_download_failed, Qt.QueuedConnection)
@@ -5198,6 +5198,15 @@ class MainWindow(QMainWindow):
 
     def _on_update_downloaded(self, path: str) -> None:
         if self._closing_down:
+            return
+        cancel_check = self._update_download_cancel_check
+        if cancel_check is not None and cancel_check():
+            # This GUI-thread commit point also catches cancellation after the
+            # worker's final check, before its queued completion is delivered.
+            try:
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
             return
         self._update_progress.close()
         try:
@@ -5215,6 +5224,8 @@ class MainWindow(QMainWindow):
         if self._closing_down:
             return
         self._update_progress.close()
+        if msg == updater.DOWNLOAD_CANCELLED_MESSAGE:
+            return
         QMessageBox.warning(
             self, "Update failed",
             f"The download didn't complete:\n{msg}",

@@ -16,6 +16,7 @@ import atexit
 import hashlib
 import json
 import os
+import secrets
 import shutil
 import stat
 import subprocess
@@ -23,7 +24,7 @@ import sys
 import threading
 import time
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal
@@ -32,10 +33,35 @@ from PySide6.QtCore import QObject, QThread, Qt, Signal
 GITHUB_REPO = "Sin213/cove-video-editor"
 LATEST_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 FETCH_DEADLINE_S = 10.0
-# Covers one 20 s socket read timeout with margin, not an overall download
-# deadline. Joins are bounded best effort; DNS, multi-address connects, trickling
-# buffered reads and the sidecar fetch can outlast them. A live pair is retained,
-# never terminated, but Qt teardown can still abort at exit (L3b; follow-up M5).
+DOWNLOAD_CONNECT_DEADLINE_S = 45
+DOWNLOAD_MIN_RATE_BPS = 128 * 1024
+DOWNLOAD_BODY_MIN_S = 120
+DOWNLOAD_BODY_MAX_S = 3600
+DOWNLOAD_VERIFY_DEADLINE_S = 120
+DOWNLOAD_CANCELLED_MESSAGE = "cancelled"
+DOWNLOAD_CONNECT_TIMEOUT_MESSAGE = (
+    "Timed out waiting for the update server. Check your internet connection, "
+    "then restart Cove to be offered the update again, or get it from "
+    f"github.com/{GITHUB_REPO}/releases."
+)
+DOWNLOAD_BODY_TIMEOUT_MESSAGE = (
+    "Timed out: the download was too slow or stalled and was stopped. Check "
+    "your internet connection, then restart Cove to be offered the update "
+    f"again, or get it from github.com/{GITHUB_REPO}/releases."
+)
+DOWNLOAD_VERIFY_TIMEOUT_MESSAGE = (
+    "Timed out while verifying the download, so it was discarded. Restart "
+    "Cove to be offered the update again, or get it from "
+    f"github.com/{GITHUB_REPO}/releases."
+)
+_DOWNLOAD_TIMEOUT_MESSAGES = {
+    "connect": DOWNLOAD_CONNECT_TIMEOUT_MESSAGE,
+    "body": DOWNLOAD_BODY_TIMEOUT_MESSAGE,
+    "verify": DOWNLOAD_VERIFY_TIMEOUT_MESSAGE,
+}
+# Workers poll cancellation every ~25 ms. Joins are upper bounds, not network
+# timeouts: daemon I/O has LOGICAL deadlines and cannot publish after abandon.
+# Retain any running Qt pair until it stops; never terminate it.
 SHUTDOWN_JOIN_MS = 22_000
 
 # Keep both objects owned even if a window never receives closeEvent (for
@@ -64,13 +90,11 @@ def _register_update_thread(thread: QThread, worker: QObject) -> None:
 def shutdown_update_threads(timeout_ms: int = SHUTDOWN_JOIN_MS) -> list[tuple[QThread, QObject]]:
     """Cancel and join owned updater threads within one total time budget.
 
-    The 22 s default covers one 20 s socket read timeout and the normal stalled
-    read case, not an overall download deadline. DNS, multi-address connects,
-    buffered reads receiving trickling data and sidecar fetching can outlast
-    this bounded best-effort join. Retain and return any live pair, never
-    terminate it; Qt teardown can still abort at exit. That download residual is
-    deferred under L3b to follow-up M5. Update checks have independent logical
-    deadlines and prompt cancellation. All waits return as soon as threads stop.
+    Both updater workers poll cancellation every ~25 ms, independently of
+    blocking daemon I/O. Their deadlines are LOGICAL: DNS or sockets may remain
+    blocked, but those daemons hold no Qt objects and cannot publish. The 22 s
+    default is a join upper bound; waits return as soon as threads stop. Retain
+    and return any live Qt pair, never terminate it.
     """
     deadline = time.monotonic() + max(0, timeout_ms) / 1000.0
     pairs = list(_LIVE_UPDATE_THREADS)
@@ -319,8 +343,101 @@ class UpdateCheckWorker(QObject):
         self.updateAvailable.emit(info)
 
 
+def _download_body_budget(total: int) -> float:
+    if total <= 0:
+        return DOWNLOAD_BODY_MAX_S
+    return min(DOWNLOAD_BODY_MAX_S,
+               max(DOWNLOAD_BODY_MIN_S, total / DOWNLOAD_MIN_RATE_BPS))
+
+
+@dataclass
+class _DownloadState:
+    """Plain daemon state. Contains no QObject, signal or worker reference."""
+
+    url: str
+    temp: Path
+    output: object
+    lock: object = field(default_factory=threading.Lock)
+    abandoned: threading.Event = field(default_factory=threading.Event)
+    completed: threading.Event = field(default_factory=threading.Event)
+    wake: threading.Event = field(default_factory=threading.Event)
+    stage: str = "connect"
+    started: float = field(default_factory=time.monotonic)
+    budget: float = DOWNLOAD_CONNECT_DEADLINE_S
+    total: int = 0
+    written: int = 0
+    error: str | None = None
+    done: bool = False
+
+
+def _advance_download_phase(state: _DownloadState, stage: str, budget: float) -> bool:
+    """An overdue phase cannot borrow the following phase's budget."""
+    with state.lock:
+        now = time.monotonic()
+        if now > state.started + state.budget:
+            state.error = _DOWNLOAD_TIMEOUT_MESSAGES[state.stage]
+            state.wake.set()
+            return False
+        state.stage, state.started, state.budget = stage, now, budget
+        state.wake.set()
+        return True
+
+
+def _download_to_temp(state: _DownloadState) -> None:
+    """Blocking I/O in one plain daemon; only the supervisor can publish."""
+    try:
+        if state.abandoned.is_set():
+            return
+        req = urllib.request.Request(
+            state.url, headers={"User-Agent": "cove-video-editor-updater"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            total = int(resp.headers.get("Content-Length") or 0)
+            with state.lock:
+                state.total = total
+            if not _advance_download_phase(state, "body", _download_body_budget(total)):
+                return
+            while not state.abandoned.is_set():
+                chunk = resp.read(262144)
+                if state.abandoned.is_set():
+                    return
+                if not chunk:
+                    break
+                state.output.write(chunk)
+                with state.lock:
+                    state.written += len(chunk)
+            if state.abandoned.is_set():
+                return
+            # End-of-body starts the verification budget, including flush and
+            # response cleanup as well as the sidecar fetch and hashing.
+            if not _advance_download_phase(state, "verify", DOWNLOAD_VERIFY_DEADLINE_S):
+                return
+        state.output.close()
+        if state.abandoned.is_set():
+            return
+        # Mandatory sidecar verification applies to the private temp only;
+        # verify_sha256 retains its existing unlink-on-failure semantics.
+        verify_sha256(state.temp, state.url + ".sha256")
+        with state.lock:
+            state.done = True
+            state.wake.set()
+    except Exception as exc:  # noqa: BLE001
+        with state.lock:
+            state.error = str(exc)
+            state.wake.set()
+    finally:
+        state.output.close()
+        state.completed.set()
+        state.wake.set()
+
+
+def _publish_download(temp: Path, dest: Path) -> None:
+    """The supervisor alone publishes verified bytes atomically."""
+    os.replace(temp, dest)
+
+
 class DownloadWorker(QObject):
-    """Stream a URL to a destination file, emitting progress as percentage."""
+    """Supervise a private download, emitting all signals on the QThread."""
 
     progress = Signal(int)           # 0–100
     finished = Signal(str)           # destination path
@@ -330,40 +447,98 @@ class DownloadWorker(QObject):
         super().__init__()
         self._url = url
         self._dest = dest
-        self._cancelled = False
+        self._cancelled = threading.Event()
+        self._wake = threading.Event()
 
     def cancel(self) -> None:
-        self._cancelled = True
+        self._cancelled.set()
+        self._wake.set()
+
+    def is_cancelled(self) -> bool:
+        """Read-only cancellation state, including after finished was queued."""
+        return self._cancelled.is_set()
 
     def run(self) -> None:
+        """Poll cancel and finite per-phase LOGICAL deadlines every 25 ms.
+
+        DNS and socket syscalls cannot be interrupted here. A stalled daemon
+        may outlive this QThread, but holds no Qt objects, writes only its open
+        private temp, and can never publish. Abandon unlinks that temp without
+        waiting for the daemon (late writes reach an unlinked inode).
+        Cancellation and daemon phase/completion changes wake the supervisor
+        immediately. Clear the wake handle before reading fresh state, so a
+        concurrent notification cannot be lost; the poll ceiling stays 25 ms.
+        """
+        if self._cancelled.is_set():
+            self.failed.emit(DOWNLOAD_CANCELLED_MESSAGE)
+            return
+        state = None
+        temp = None
+        output = None
+        owns_temp = False
+        daemon_started = False
         try:
-            req = urllib.request.Request(
-                self._url, headers={"User-Agent": "cove-video-editor-updater"},
+            self._dest.parent.mkdir(parents=True, exist_ok=True)
+            temp = self._dest.with_name(
+                f"{self._dest.name}.{os.getpid()}-{secrets.token_hex(8)}.part",
             )
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                total = int(resp.headers.get("Content-Length") or 0)
-                written = 0
-                self._dest.parent.mkdir(parents=True, exist_ok=True)
-                with open(self._dest, "wb") as f:
-                    while True:
-                        if self._cancelled:
-                            raise RuntimeError("cancelled")
-                        chunk = resp.read(262144)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        written += len(chunk)
-                        if total > 0:
-                            self.progress.emit(int(written * 100 / total))
-            # The release pipeline publishes a `<asset>.sha256` sidecar
-            # next to every artifact, so its download URL is the asset
-            # URL plus the suffix. Verify before signalling success;
-            # verify_sha256 unlinks the partial on any failure.
-            verify_sha256(self._dest, self._url + ".sha256")
+            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+            owns_temp = True
+            try:
+                output = os.fdopen(fd, "wb")
+            except Exception:
+                os.close(fd)
+                raise
+            state = _DownloadState(self._url, temp, output,
+                                   budget=DOWNLOAD_CONNECT_DEADLINE_S, wake=self._wake)
+            download = threading.Thread(
+                target=_download_to_temp, args=(state,), daemon=True,
+                name="cove-update-download",
+            )
+            download.start()
+            daemon_started = True
+            last_progress = -1
+            while True:
+                self._wake.clear()
+                if self._cancelled.is_set():
+                    raise RuntimeError(DOWNLOAD_CANCELLED_MESSAGE)
+                with state.lock:
+                    stage, started, budget = state.stage, state.started, state.budget
+                    total, written = state.total, state.written
+                    error, done = state.error, state.done
+                if error is not None:
+                    raise RuntimeError(error)
+                if total > 0:
+                    progress = min(100, max(0, int(written * 100 / total)))
+                    if progress != last_progress:
+                        self.progress.emit(progress)
+                        last_progress = progress
+                if done:
+                    break
+                remaining = started + budget - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(_DOWNLOAD_TIMEOUT_MESSAGES[stage])
+                self._wake.wait(min(0.025, remaining))
+            if self._cancelled.is_set():
+                raise RuntimeError(DOWNLOAD_CANCELLED_MESSAGE)
+            # Verification/publication use a temp pathname in a user-owned
+            # cache. An actor who can alter that directory already controls
+            # the user's files (the accepted cache-directory threat model).
+            _publish_download(temp, self._dest)
+            if self._cancelled.is_set():
+                # Roll back the bytes just published. A stale pre-existing
+                # cache entry replaced by us is lost in this narrow race.
+                self._dest.unlink(missing_ok=True)
+                raise RuntimeError(DOWNLOAD_CANCELLED_MESSAGE)
             self.finished.emit(str(self._dest))
         except Exception as exc:  # noqa: BLE001
+            if state is not None:
+                state.abandoned.set()
+            if output is not None and not daemon_started:
+                output.close()
             try:
-                self._dest.unlink(missing_ok=True)
+                if owns_temp:
+                    temp.unlink(missing_ok=True)
             except Exception:  # noqa: BLE001
                 pass
             self.failed.emit(str(exc))
