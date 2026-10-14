@@ -321,6 +321,8 @@ Unknown options or stray arguments are rejected with exit code 2.
 You can also use **Project -> Open Project...** in the GUI. GUI **Save** overwrites
 the opened file; use **Project -> Save As** to keep an MCP-generated revision.
 MCP revisions are immutable/no-clobber only under the MCP publication contract.
+For projects edited with Pi/MCP, see the [AI-to-GUI handoff](docs/MCP.md#ai-to-gui-handoff)
+for saving a revision and opening it yourself in Cove.
 
 ---
 

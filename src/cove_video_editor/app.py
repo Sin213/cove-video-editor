@@ -240,6 +240,13 @@ def drain_surviving_media_threads(timeout_ms: int = 8000) -> None:
     about that long in the worst case rather than as long as ffmpeg. The
     cancel is repeated here because a worker that had already re-entered
     ffmpeg still needs telling.
+
+    Update downloads can also be parked here. Their cancellation cannot
+    interrupt a socket read. The registry's 22 s atexit budget covers one 20 s
+    read timeout, not an overall download deadline: DNS, multi-address connects,
+    trickling buffered reads and sidecar fetching can outlast these best-effort
+    joins. Live pairs remain owned and are never terminated, but Qt teardown
+    can still abort at exit; L3b defers that download residual to follow-up M5.
     """
     deadline = time.monotonic() + max(0, timeout_ms) / 1000.0
     for thread, worker in list(_SURVIVING_MEDIA_THREADS):
@@ -1226,14 +1233,19 @@ class MainWindow(QMainWindow):
         self._start_encoder_probe()
         self.setAcceptDrops(True)
         # Update checker plumbing — populated on demand.
+        self._closing_down = False
         self._update_thread: QThread | None = None
         self._update_worker = None
         self._update_download_thread: QThread | None = None
         self._update_download_worker = None
+        self._update_progress: QProgressDialog | None = None
         self._update_prompt_shown = False
         # Kick off the first check a moment after the UI comes up so the
         # user doesn't notice any startup hitch.
-        QTimer.singleShot(4000, self._check_for_updates_in_background)
+        self._update_timer = QTimer(self)
+        self._update_timer.setSingleShot(True)
+        self._update_timer.timeout.connect(self._check_for_updates_in_background)
+        self._update_timer.start(4000)
 
     # --- frameless window helpers -------------------------------------
 
@@ -4965,6 +4977,30 @@ class MainWindow(QMainWindow):
         return False
 
     def closeEvent(self, event) -> None:  # noqa: ANN001
+        self._closing_down = True
+        self._update_timer.stop()
+        for worker in (self._update_worker, self._update_download_worker):
+            if worker is not None:
+                worker.cancel()
+        # Update checks can stop waiting on DNS immediately. Download workers
+        # have no overall deadline (DNS, multi-address connects, trickling reads,
+        # sidecar fetch). Park for bounded best-effort drain/atexit joins; even
+        # the 22 s budget only covers one 20 s read timeout. A live pair remains
+        # owned, never terminated; exit can still abort (L3b; follow-up M5).
+        for thread, worker in (
+            (self._update_thread, self._update_worker),
+            (self._update_download_thread, self._update_download_worker),
+        ):
+            if thread is not None:
+                _join_or_survive(thread, worker)
+        self._update_thread = self._update_worker = None
+        self._update_download_thread = self._update_download_worker = None
+        if self._update_progress is not None:
+            # close() emits canceled and nests a dialog close here, which can
+            # prevent lastWindowClosed from quitting. Workers are cancelled above.
+            self._update_progress.hide()
+            self._update_progress.deleteLater()
+            self._update_progress = None
         for d in (self._thumb_workers, self._wave_workers, self._added_wave_workers):
             for worker in list(d.values()):
                 try:
@@ -5071,7 +5107,7 @@ class MainWindow(QMainWindow):
     def _check_for_updates_in_background(self) -> None:
         """Fire-and-forget GitHub releases poll. Silent on success/failure
         unless a newer version shows up — then `_on_update_available` fires."""
-        if self._update_thread is not None:
+        if self._closing_down or self._update_thread is not None:
             return
         thread, worker = updater.start_check(__version__)
         worker.updateAvailable.connect(self._on_update_available, Qt.QueuedConnection)
@@ -5085,12 +5121,14 @@ class MainWindow(QMainWindow):
         self._update_worker = None
 
     def _on_update_available(self, info) -> None:
-        if self._update_prompt_shown:
+        if self._closing_down or self._update_prompt_shown:
             return
         self._update_prompt_shown = True
         self._prompt_update(info)
 
     def _prompt_update(self, info) -> None:
+        if self._closing_down:
+            return
         kind = updater.bundle_kind()
         can_auto_install = kind == "appimage" and bool(info.asset_url)
 
@@ -5117,6 +5155,8 @@ class MainWindow(QMainWindow):
             open_btn = msg.addButton("View release", QMessageBox.AcceptRole)
             msg.addButton("Later", QMessageBox.RejectRole)
         msg.exec()
+        if self._closing_down:
+            return
         clicked = msg.clickedButton()
         if install_btn is not None and clicked is install_btn:
             self._install_update(info)
@@ -5124,6 +5164,8 @@ class MainWindow(QMainWindow):
             _open_url(info.release_url)
 
     def _install_update(self, info) -> None:
+        if self._closing_down:
+            return
         if not info.asset_url:
             _open_url(info.release_url)
             return
@@ -5155,6 +5197,8 @@ class MainWindow(QMainWindow):
         thread.start()
 
     def _on_update_downloaded(self, path: str) -> None:
+        if self._closing_down:
+            return
         self._update_progress.close()
         try:
             new_path = updater.swap_in_appimage(Path(path))
@@ -5168,6 +5212,8 @@ class MainWindow(QMainWindow):
         QApplication.instance().quit()
 
     def _on_update_download_failed(self, msg: str) -> None:
+        if self._closing_down:
+            return
         self._update_progress.close()
         QMessageBox.warning(
             self, "Update failed",

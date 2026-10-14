@@ -12,6 +12,7 @@ runs the installer themselves from there.
 """
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import os
@@ -19,15 +20,68 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
+import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QThread, Signal
+from PySide6.QtCore import QObject, QThread, Qt, Signal
 
 
 GITHUB_REPO = "Sin213/cove-video-editor"
 LATEST_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+FETCH_DEADLINE_S = 10.0
+# Covers one 20 s socket read timeout with margin, not an overall download
+# deadline. Joins are bounded best effort; DNS, multi-address connects, trickling
+# buffered reads and the sidecar fetch can outlast them. A live pair is retained,
+# never terminated, but Qt teardown can still abort at exit (L3b; follow-up M5).
+SHUTDOWN_JOIN_MS = 22_000
+
+# Keep both objects owned even if a window never receives closeEvent (for
+# example, an application event loop ends via exit()). Only stopped threads
+# may be released. The single atexit hook runs before Qt tears them down.
+_LIVE_UPDATE_THREADS: list[tuple[QThread, QObject]] = []
+_SHUTDOWN_HOOK_REGISTERED = False
+
+
+def _prune_update_threads() -> None:
+    _LIVE_UPDATE_THREADS[:] = [
+        pair for pair in _LIVE_UPDATE_THREADS if not pair[0].isFinished()
+    ]
+
+
+def _register_update_thread(thread: QThread, worker: QObject) -> None:
+    global _SHUTDOWN_HOOK_REGISTERED
+    _prune_update_threads()
+    _LIVE_UPDATE_THREADS.append((thread, worker))
+    thread.finished.connect(_prune_update_threads, Qt.QueuedConnection)
+    if not _SHUTDOWN_HOOK_REGISTERED:
+        atexit.register(shutdown_update_threads)
+        _SHUTDOWN_HOOK_REGISTERED = True
+
+
+def shutdown_update_threads(timeout_ms: int = SHUTDOWN_JOIN_MS) -> list[tuple[QThread, QObject]]:
+    """Cancel and join owned updater threads within one total time budget.
+
+    The 22 s default covers one 20 s socket read timeout and the normal stalled
+    read case, not an overall download deadline. DNS, multi-address connects,
+    buffered reads receiving trickling data and sidecar fetching can outlast
+    this bounded best-effort join. Retain and return any live pair, never
+    terminate it; Qt teardown can still abort at exit. That download residual is
+    deferred under L3b to follow-up M5. Update checks have independent logical
+    deadlines and prompt cancellation. All waits return as soon as threads stop.
+    """
+    deadline = time.monotonic() + max(0, timeout_ms) / 1000.0
+    pairs = list(_LIVE_UPDATE_THREADS)
+    for thread, worker in pairs:
+        worker.cancel()
+        thread.quit()
+    for thread, _worker in pairs:
+        remaining = int((deadline - time.monotonic()) * 1000)
+        thread.wait(max(0, remaining))
+    _LIVE_UPDATE_THREADS[:] = [pair for pair in _LIVE_UPDATE_THREADS if pair[0].isRunning()]
+    return list(_LIVE_UPDATE_THREADS)
 
 
 @dataclass
@@ -174,6 +228,16 @@ def fetch_latest_release(timeout: float = 8.0) -> dict | None:
         return None
 
 
+def _fetch_release(holder: dict, completed: threading.Event) -> None:
+    """Plain daemon-thread work: no Qt objects, signals or worker references."""
+    try:
+        holder["data"] = fetch_latest_release()
+    except Exception as exc:  # noqa: BLE001
+        holder["error"] = str(exc)
+    finally:
+        completed.set()
+
+
 class UpdateCheckWorker(QObject):
     updateAvailable = Signal(object)   # UpdateInfo
     noUpdate = Signal()
@@ -182,9 +246,53 @@ class UpdateCheckWorker(QObject):
     def __init__(self, current_version: str) -> None:
         super().__init__()
         self._current = current_version
+        self._cancelled = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancelled.set()
 
     def run(self) -> None:
-        data = fetch_latest_release()
+        """Wait at most FETCH_DEADLINE_S for a release, or until cancelled.
+
+        This is a LOGICAL deadline, not cancellation of DNS or socket I/O.
+        The inner daemon may remain blocked in getaddrinfo/urlopen after this
+        QThread finishes. It holds no Qt objects; its late result is discarded,
+        and process exit does not join it. The fetch's 8 s socket timeout stays
+        unchanged.
+        """
+        if self._cancelled.is_set():
+            self.failed.emit("cancelled")
+            return
+        holder: dict = {}
+        completed = threading.Event()
+        deadline = time.monotonic() + FETCH_DEADLINE_S
+        fetch = threading.Thread(
+            target=_fetch_release, args=(holder, completed), daemon=True,
+            name="cove-update-fetch",
+        )
+        fetch.start()
+        while True:
+            if self._cancelled.is_set():
+                self.failed.emit("cancelled")
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.failed.emit("could not reach the releases API (timed out)")
+                return
+            if completed.wait(min(0.025, remaining)):
+                break
+        # Cancellation/deadline wins even if completion arrives in the same
+        # wait slice. Only this QThread emits signals, never the inner fetch.
+        if self._cancelled.is_set():
+            self.failed.emit("cancelled")
+            return
+        if time.monotonic() >= deadline:
+            self.failed.emit("could not reach the releases API (timed out)")
+            return
+        if "error" in holder:
+            self.failed.emit(f"could not reach the releases API: {holder['error']}")
+            return
+        data = holder["data"]
         if data is None:
             self.failed.emit("could not reach the releases API")
             return
@@ -266,9 +374,12 @@ def start_check(current_version: str) -> tuple[QThread, UpdateCheckWorker]:
     worker = UpdateCheckWorker(current_version)
     worker.moveToThread(thread)
     thread.started.connect(worker.run)
-    worker.updateAvailable.connect(thread.quit)
-    worker.noUpdate.connect(thread.quit)
-    worker.failed.connect(thread.quit)
+    # quit() is thread-safe. Direct delivery lets joins finish even when the
+    # GUI event loop is blocked in closeEvent or has already returned.
+    worker.updateAvailable.connect(thread.quit, Qt.DirectConnection)
+    worker.noUpdate.connect(thread.quit, Qt.DirectConnection)
+    worker.failed.connect(thread.quit, Qt.DirectConnection)
+    _register_update_thread(thread, worker)
     return thread, worker
 
 
@@ -277,8 +388,9 @@ def start_download(url: str, dest: Path) -> tuple[QThread, DownloadWorker]:
     worker = DownloadWorker(url, dest)
     worker.moveToThread(thread)
     thread.started.connect(worker.run)
-    worker.finished.connect(thread.quit)
-    worker.failed.connect(thread.quit)
+    worker.finished.connect(thread.quit, Qt.DirectConnection)
+    worker.failed.connect(thread.quit, Qt.DirectConnection)
+    _register_update_thread(thread, worker)
     return thread, worker
 
 

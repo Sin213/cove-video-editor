@@ -219,12 +219,7 @@ NNNN is the edit-revision counter; the first save may be r0003. Media is referen
 in place, never copied: keep source videos, audio and subtitle files where they are. Publication is
 via exclusive temp + descriptor-relative hard link. Earlier revisions are never
 overwritten. Unchanged saves verify the recorded hash; external changes are
-refused. Open the returned saved .coveproj using Project (menu button) -> Open Project..., rather than 'Add media files'.
-Alternatively, run `PYTHONPATH=src python3 -m cove_video_editor --project "/absolute/path/revision.coveproj"`.
-Run this from the repository checkout root so `PYTHONPATH=src` finds its `src` directory.
-This is Linux/macOS shell syntax, exercised only on Linux; for the project venv,
-replace `python3` with `.venv/bin/python`.
-GUI Save overwrites that file; use Project -> Save As to preserve the MCP revision.
+refused. See [AI-to-GUI handoff](#ai-to-gui-handoff) to open a saved revision.
 
 Errors use bounded text and structured application errors; protocol errors remain SDK-owned.
 
@@ -278,14 +273,41 @@ Verify: ask the agent to call `cove_get_capabilities`; check `media_roots`/`outp
    verified published path only on SUCCEEDED. Edits after admission do not change
    the bound saved revision/hash; save again before starting another export.
 
-After export: open the saved .coveproj via Project (menu button) -> Open Project...,
-never 'Add media files'. Play the MP4 at output.path in any media player;
-'Add media files' may import that MP4 into Cove as a clip.
-Alternatively, open the project with `PYTHONPATH=src python3 -m cove_video_editor --project "/absolute/path/revision.coveproj"`.
-Run this from the repository checkout root so `PYTHONPATH=src` finds its `src` directory.
-This is Linux/macOS shell syntax, exercised only on Linux; for the project venv,
-replace `python3` with `.venv/bin/python`.
-Use Project -> Save As to preserve the MCP revision; GUI Save overwrites the opened file.
+After export, follow [AI-to-GUI handoff](#ai-to-gui-handoff) to open the saved
+project. Play the MP4 at output.path in any media player; 'Add media files' may
+import that MP4 into Cove as a clip.
+
+### AI-to-GUI handoff
+
+Pi/MCP performs the edits, then `cove_save_project` writes an immutable
+`.coveproj` revision and returns its absolute path. **You launch Cove yourself**;
+the AI does not launch or control the GUI. Use the returned path:
+
+```bash
+cd /home/sin/Projects/cove-video-editor  # your checkout
+PYTHONPATH=src python3 -m cove_video_editor --project "/absolute/path/from/mcp/project.r0004.coveproj"
+```
+
+Cove opens that project automatically. This is
+Linux/macOS shell syntax, exercised only on Linux; for the project venv, replace
+`python3` with `.venv/bin/python`. Alternatively, use **Project -> Open Project...**.
+Do not use **Add media files** for a `.coveproj`, or edit project JSON by hand.
+GUI **Save** overwrites the opened file; use **Project -> Save As** to keep the
+MCP revision intact.
+An already-running Cove is not reused; each launch opens a separate process.
+Saving the same `.coveproj` from two Cove processes silently overwrites the file.
+
+If opening fails:
+
+A bad `--project` path prints an error in the launch terminal and exits with
+code 2; no window opens.
+
+- Use the absolute returned path, quoted if it contains spaces; it must exist
+  and end in `.coveproj`.
+- Relative paths resolve from the directory where you launch Cove.
+- A dash-leading filename needs the equals form: `--project=PATH`.
+
+### Verify an existing-project import
 
 For an existing project, manually verify this sequence:
 1. Check capabilities for project_roots, media_roots and output_root. Record the
